@@ -78,37 +78,8 @@
 - **实际结果**：前端 `handleLogin` 的 catch 分支统一展示「用户名或密码错误」，此时后端因 `findByUsername` 正常返回该文案一致，无明显异常；但若出现网络/超时等非业务错误，前端同样被识别为「用户名或密码错误」，提示与真实原因不符。
 - **定位分析**：`Login.vue` 的 `handleLogin().catch()` 未区分业务错误与网络错误，统一归为密码错误。
 
-### BUG-L002　【认证 / 一般】　※ 标注类型：示例
-- **Bug标题**：认证业务异常统一返回 HTTP 200，不符合 REST 语义
-- **前置条件**：系统可访问 `/api/auth/login`
-- **重现步骤**
-  1. `POST /api/auth/login` 传入不存在的用户名；
-  2. 观察 HTTP 状态码与响应体。
-- **预期结果**：认证失败应返回 HTTP 400 / 401 语义状态码。
-- **实际结果**：HTTP 200，`code=500`，`message="用户不存在"`（由 `ApiResponse.error()` 返回，未改变 HTTP 状态码）。
-- **定位分析**：`AuthController` 用 `try/catch` 包裹并返回 `ApiResponse.error(e.getMessage())`，异常被吞入 HTTP 200。
-
-### BUG-L003　【认证 / 轻微】　※ 标注类型：示例
-- **Bug标题**：注册接口不校验密码强度，弱密码可通过
-- **前置条件**：系统可访问 `/api/auth/register`
-- **重现步骤**
-  1. `POST /api/auth/register`，`password="1"`；
-  2. 观察是否注册成功。
-- **预期结果**：密码应有最小长度/复杂度校验并给出明确提示。
-- **实际结果**：注册成功，密码仅做加密落库，未做强度校验。
-- **定位分析**：`RegisterRequest` 无校验注解，`AuthController.register` 未增加前置判断。
-
-### BUG-L004　【认证 / 轻微】　※ 标注类型：示例
-- **Bug标题**：登录接口对缺失用户名/密码返回 500，而不是参数校验提示
-- **前置条件**：系统可访问 `/api/auth/login`
-- **重现步骤**
-  1. `POST /api/auth/login`，body 为 `{}`；
-  2. 观察响应。
-- **预期结果**：返回「用户名不能为空」等参数校验提示（HTTP 400）。
-- **实际结果**：`login()` 中 `findByUsername(null)` 抛异常，被 catch 后返回 HTTP 200 + `code=500` + message="用户不存在"。
-- **定位分析**：缺少对 `username/password` 的必填校验。
-
 ---
+## 四、实际发现Bug
 
 ### BUG-DATA-001 已终止合同关联缴费记录未清理
 - **发现时间**：2026-09-10
