@@ -17,6 +17,8 @@ Apartment-rental/
     ├── automation/
     │   ├── test_core_flow.py          # pytest 接口自动化：登录→房源查询→预约提交
     │   └── ui_test_login.py           # Playwright UI 自动化：登录页冒烟测试
+    ├── evidence/
+    │   └── BUG-DATA-001
     └── sql/
         └── contract_payment_consistency.sql  # 合同状态与支付流水一致性 SQL + 执行结果摘要
 ```
