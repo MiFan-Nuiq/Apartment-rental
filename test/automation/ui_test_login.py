@@ -60,6 +60,7 @@ def test_login_success(browser):
 
     # 4. 断言跳转成功：URL 进入角色对应主页
     page.wait_for_url("**" + EXPECT_REDIRECT, timeout=10000)
+    page.screenshot(path="test/evidence/ui_login_success.png")
     assert EXPECT_REDIRECT in page.url, f"登录后未跳转到 {EXPECT_REDIRECT}，当前：{page.url}"
 
     # 5. 断言登录态已写入 localStorage
