@@ -1,0 +1,8 @@
+# 自动化测试工程依赖清单 —— 在 test/automation 目录下执行 pip install -r requirements.txt 安装
+# 说明：各依赖用途见行内注释；版本为推荐版本，可结合本地 Python 版本调整
+
+requests>=2.31.0        # HTTP 请求库：接口层与请求工具的基础
+pytest>=8.0.0           # 测试框架：用例收集、执行与 fixture 管理
+allure-pytest>=2.13.2   # Allure 报告插件：生成 allure-results 测试报告数据
+playwright>=1.40.0      # 浏览器自动化库：UI 登录用例依赖（对应原 ui_test_login.py）
+pytest-playwright>=0.4.0  # pytest 与 Playwright 集成插件（提供浏览器 fixture）
