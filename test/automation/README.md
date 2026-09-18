@@ -48,7 +48,12 @@ test/automation/
 ├── conftest.py                  # 共享 fixture（接口/数据库/UI）+ 失败截图钩子
 ├── pytest.ini                   # pytest 配置（markers、strict-markers、allure 输出）
 ├── requirements.txt             # 依赖清单
-── README.md                    # 本说明
+└── README.md                    # 本说明
+
+test/sql/                        # 测试用 SQL 脚本（CI 会导入其中的前两个）
+├── schema.sql                   # 【新增】建表脚本：users/apartments/appointments/contracts/payments
+├── data.sql                     # 【新增】种子数据：3 账号 + 3 房源 + 合同/流水/预约
+└── contract_payment_consistency.sql   # 手工执行的 3 条一致性校验 SQL（已用例化到 test_data_consistency.py）
 ```
 
 ## 三、环境要求
@@ -200,12 +205,93 @@ playwright show-trace traces/<用例名>.zip     # 打开可视化回放器
 
 工作流文件：`.github/workflows/auto-test.yml`，触发条件为 `push` / `pull_request`（并支持手动触发）。
 
-流水线步骤：检出代码 -> Python 3.11 -> 安装测试依赖 -> 安装 Chromium -> Java 17 -> 构建后端 ->
-启动后端与前端 -> `pytest -m smoke` -> 上传 `allure-results` / `screenshots` / `traces` 为 artifact。
+完整流水线（步骤编号与 workflow 中的注释一致）：
+
+```
+检出代码 -> Python 3.11 -> 安装测试依赖 -> 安装 Chromium -> Java 17
+  -> ⑥ 等待 MySQL 就绪（mysqladmin ping，最多 30 次 × 2 秒）
+  -> ⑦ 导入数据库结构和种子数据（test/sql/schema.sql + data.sql）
+  -> ⑧ 构建后端 -> ⑨ 启动后端并等待 8080 就绪（curl，最多 30 次 × 2 秒）
+  -> ⑩ 启动前端并等待 5173 就绪（nohup + PID + 日志）
+  -> ⑪ pytest -m smoke
+  -> ⑫⑬⑭ 上传 allure-results / screenshots / traces 为 artifact
+```
+
+### 12.1 CI 数据库初始化（本次修复重点）
+
+CI 上的 MySQL 容器是**全新空库**，JPA 的 `ddl-auto: update` 只会建出空表，
+缺数据会导致：房源列表为空、`apartment_id=3` 不存在而触发外键约束失败。
+因此 workflow 在**启动后端之前**固定执行两步导入：
+
+| 顺序 | 文件 | 内容 | 是否幂等 |
+| --- | --- | --- | --- |
+| ① | [schema.sql](../../test/sql/schema.sql) | 建表：`users` / `apartments` / `appointments` / `contracts` / `payments` | 是（`CREATE TABLE IF NOT EXISTS`） |
+| ② | [data.sql](../../test/sql/data.sql) | 种子数据：3 个账号、3 条房源、2 份合同、2 条流水、1 条预约 | 是（`INSERT ... ON DUPLICATE KEY UPDATE`） |
+
+种子数据与测试代码的对应关系（改任一侧都要同步）：
+
+| 常量（conftest.py） | 值 | 对应种子数据 |
+| --- | --- | --- |
+| `USERNAME` / `PASSWORD` | `tenant` / `123456` | `users.id = 3`（BCrypt 密文取自本项目后端） |
+| `LANDLORD_ID` | `2` | `users.id = 2` |
+| `TENANT_ID` | `3` | `users.id = 3` |
+| `APARTMENT_ID` | `3` | `apartments.id = 3`（**必须存在**，否则预约外键失败） |
+| `APPOINTMENT_TIME` | `2026-10-01 10:00:00` | 房源 3 上**不能有生效中合同**，否则预约会被 `AppointmentService` 拦截 |
+
+> schema.sql 中的表结构与字段，全部取自后端实体与 Hibernate 实际生成的 DDL（含索引/约束名），
+> 未臆造任何表名或字段名；其余业务表由 JPA `ddl-auto=update` 自动创建。
+
+**本地导出种子数据的命令（mysqldump 示例）**：
+
+```powershell
+# 1) 只导出表结构（不含数据），作为 schema.sql 的来源
+mysqldump --host=127.0.0.1 --port=3306 --user=apartment --password=123456 --no-data --skip-comments `
+  apartment_rental_db users apartments appointments contracts payments > schema_dump.sql
+
+# 2) 只导出指定表的数据（不含建表语句），作为 data.sql 的来源
+mysqldump --host=127.0.0.1 --port=3306 --user=apartment --password=123456 --no-create-info --skip-comments `
+  apartment_rental_db users apartments appointments contracts payments > data_dump.sql
+
+# 3) 本地按 CI 的顺序导入（Windows PowerShell 5.1 请用下面的 --key=value + source 写法）
+#    注意：PowerShell 5.1 会把 -h127.0.0.1 里的点号拆开（报 Unknown MySQL server host '127'），
+#          所以务必使用 --host=xxx 形式；另外 < 输入重定向在 PowerShell 中不可用，故用 source 命令
+mysql --host=127.0.0.1 --port=3306 --user=apartment --password=123456 --default-character-set=utf8mb4 `
+  --execute="source test/sql/schema.sql" apartment_rental_db
+mysql --host=127.0.0.1 --port=3306 --user=apartment --password=123456 --default-character-set=utf8mb4 `
+  --execute="source test/sql/data.sql" apartment_rental_db
+
+# 4) 导入后核对（应能看到 3 个账号、3 条房源）
+mysql --host=127.0.0.1 --port=3306 --user=apartment --password=123456 `
+  --execute="SELECT id,name,status,audit_status FROM apartments WHERE id<=3 ORDER BY id" apartment_rental_db
+```
+
+> 注意：`data.sql` 是**手工精简**过的种子数据（固定 id + 幂等写法），
+> 而不是直接 `mysqldump` 全量导出——因为本地库里含 `BUG-DATA-001` 等脏数据，
+> 全量导出会把脏数据带进 CI，一致性用例②就再也无法通过。
+
+### 12.2 CI 前端启动方式（本次修复重点）
+
+早期写法只有 `nohup npm run dev &`，没有记录 PID、没有等待就绪、失败日志也被 `continue-on-error` 吞掉，
+于是 UI 用例只表现为 `net::ERR_CONNECTION_REFUSED at http://localhost:5173/login`，很难定位。
+现在改为：
+
+```bash
+npm install --no-audit --no-fund                       # 先装依赖
+nohup npm run dev -- --host 0.0.0.0 --port 5173 --strictPort > /tmp/frontend.log 2>&1 &
+echo $! > /tmp/frontend.pid                            # 记录 PID，便于排查
+# 循环 curl http://localhost:5173，最多 30 次 × 2 秒
+# 之后 cat /tmp/frontend.log 打印日志，并再次确认 5173 可访问，否则本步骤直接失败
+```
+
+- `--strictPort`：5173 被占用时**直接失败**，避免 Vite 自动切到 5174、UI 用例却仍连 5173；
+- 去掉了该步骤的 `continue-on-error`：服务起不来就在该步骤明确报错，不再拖到用例里变成"连接被拒绝"；
+- 后端启动步骤同样加了 `curl` 就绪等待（`/api/auth/login` 是 POST 接口，GET 探测返回 405 也算服务已就绪）。
+
+### 12.3 其他说明
 
 - CI 中会启动 MySQL 8 服务容器（库名 `apartment_rental_db`，账号 `apartment/123456`），与后端默认配置一致；
 - UI 用例通过 `HEADLESS=true` 无头运行；
-- 构建/启动后端与前端两步设置了 `continue-on-error: true`：若启动失败，冒烟测试会明确失败，需查看日志排查；
+- `构建后端` 步骤保留了 `continue-on-error: true`，但后续"启动后端"步骤不再吞错——jar 没构建出来就会在此明确失败；
 - **首次使用需人工在 GitHub 仓库开启 Actions 并验证一次流水线**（见下节）。
 
 ## 十三、生成 Allure 报告
@@ -242,11 +328,19 @@ allure generate allure-results -o allure-report --clean   # 或生成静态报�
 - [ ] `pytest -m db` 必须在 **MySQL 可用且有真实数据** 的前提下执行，否则 `db_connection` fixture 会给出连接失败提示并 fail。
 - [ ] `test_core_flow.py::test_submit_appointment` 的落库断言需要 `APARTMENT_ID`（默认 3）真实存在且与房东匹配。
 - [ ] 一致性用例依赖真实业务数据；`test_payment_exists_for_inactive_contract` 已按已知缺陷 `BUG-DATA-001` 标记 `xfail`。
+- [ ] 本地导入种子数据（`test/sql/schema.sql` + `data.sql`）需要数据库写权限；**若想完整模拟"全新空库"（CI 场景），需要 MySQL 的
+      `CREATE DATABASE` / `DROP DATABASE` 权限**——当前 `apartment` 账号只有 `apartment_rental_db.*` 权限，
+      自动化工具无法建临时库做这一步验证。请用有权限的账号（如 root）执行，或直接在 CI 首次运行时验证。
+- [ ] 导入后请人工确认 **表结构与后端一致**：后端启动日志中 Hibernate 若对该 5 张表执行了 `alter table`，
+      说明 `schema.sql` 与实体有偏差，需要按实体修正（正常情况应为"无变更"）。
 
 ### 4. GitHub 账号相关操作
-- [ ] 将代码 `git push` 到 GitHub 仓库（工作流才会生效）。
+- [ ] 将代码 `git push` 到 GitHub 仓库（工作流才会生效）。本次新增/修改了 `.github/workflows/auto-test.yml`、
+      `test/sql/schema.sql`、`test/sql/data.sql`，**必须推送后 CI 才会用上新逻辑**。
 - [ ] 在仓库 **Settings -> Actions -> General** 确认 Actions 已启用（Allow all actions）。
 - [ ] 首次推送后到 **Actions** 页手动触发一次 `workflow_dispatch`，确认流水线可跑通（CI 环境无法在本地验证）。
+- [ ] 重点看这 4 步的日志：`等待 MySQL 就绪`、`导入数据库结构和种子数据`、`启动后端服务并等待就绪`、
+      `启动前端服务并等待就绪`——本次修复的 4 个失败用例都依赖它们。
 - [ ] 若 CI 中数据库/端口与默认值不同，需在仓库 **Settings -> Secrets and variables -> Actions** 配置对应变量或改 workflow。
 - [ ] 如需 Allure 在线报告（如 GitHub Pages），需额外配置 Pages 部署，当前仅上传 artifact。
 
@@ -259,10 +353,31 @@ allure generate allure-results -o allure-report --clean   # 或生成静态报�
 - [ ] 首次运行 `pytest -m db` 前，建议先手工执行 `test/sql/contract_payment_consistency.sql` 确认数据现状。
 - [ ] `xfail` 用例的数据修复（BUG-DATA-001）需由开发侧处理，修复后建议将 `xfail` 改为普通断言。
 - [ ] 数据驱动新增用例时，需人工确认 YAML 中的 `apartment_id` / `tenant_id` / `landlord_id` 与真实数据一致。
+- [ ] **种子数据需要长期维护**：若后续改了 `conftest.py` 里的 `APARTMENT_ID` / `TENANT_ID` / `LANDLORD_ID`，
+      必须同步修改 `test/sql/data.sql`（见 12.1 的对应关系表），否则 CI 会重新出现外键约束失败。
+- [ ] 若数据库表结构（实体）发生变更，`schema.sql` 需要同步更新（用 12.1 的 `mysqldump --no-data` 重新导出即可）。
+- [ ] Windows PowerShell 5.1 的两个坑已在 12.1 中给出规避写法：
+      ① 原生命令参数里的点号会被拆开（`-h127.0.0.1` 失效），要改用 `--host=127.0.0.1`；
+      ② 不支持 `<` 输入重定向，要改用 `mysql --execute="source xxx.sql"`。
 
 ## 十五、运行记录
 
-最近一次实际执行（2026-09-16，后端 8080 + 前端 5173 + MySQL 3306 均已启动，`HEADLESS=true`）：
+### 15.1 本次 CI 失败修复的验证（2026-09-18）
+
+修复对象：CI 中失败的 4 个 `pytest -m smoke` 用例
+（`test_query_apartments` / `test_submit_appointment` / `test_full_flow` / `test_ui_login`）。
+
+| 验证项 | 命令 / 方式 | 实际结果 |
+| --- | --- | --- |
+| schema.sql 可执行 | 导入 `test/sql/schema.sql` | 5 条建表语句全部成功 |
+| data.sql 可执行 | 导入 `test/sql/data.sql` | 5 条数据语句全部成功，中文无乱码 |
+| 种子数据幂等 | 连续导入 2 次 | 用户 5 条、房源 6 条不变，无重复行 |
+| 种子数据正确性 | `SELECT ... FROM apartments WHERE id<=3` | 房源 1/2/3 均为 `空置` + `审核通过`，`landlord_id=2` |
+| 冒烟用例 | `pytest -m smoke` | **6 passed, 12 deselected in 3.06s** |
+| 数据库用例 | `pytest -m db` | 3 passed, 1 xfailed（4 selected） |
+| workflow 语法 | `yaml.safe_load(auto-test.yml)` | 校验通过，14 个步骤顺序正确 |
+
+### 15.2 历史运行记录（2026-09-16）
 
 | 执行命令 | 实际结果 |
 | --- | --- |

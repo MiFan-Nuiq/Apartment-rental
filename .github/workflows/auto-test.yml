@@ -1,5 +1,10 @@
 # GitHub Actions 工作流 —— 公寓租赁管理系统自动化测试
 # 说明：push / pull_request 时自动执行冒烟测试，并上传 Allure 结果与 UI 失败截图/trace
+#
+# 环境准备链路（关键，缺一不可）：
+#   MySQL 服务容器就绪 -> 导入 test/sql/schema.sql 建表 -> 导入 test/sql/data.sql 种子数据
+#   -> 构建并启动后端 -> 等待 8080 可访问 -> 后台启动前端 Vite -> 等待 5173 可访问 -> 跑 pytest
+#
 # 注意：首次使用需人工在 GitHub 仓库确认 Actions 已开启（见 README「需要人工完成的事项」）
 
 name: 自动化测试
@@ -12,7 +17,7 @@ on:
 
 jobs:
   test:
-    # 使用最新的 Ubuntu 运行器（已预装 Maven 与 Java）
+    # 使用最新的 Ubuntu 运行器（已预装 Maven、Java、MySQL 客户端）
     runs-on: ubuntu-latest
 
     # MySQL 服务容器：为后端提供数据库，库名/账号与 application.yml 默认值保持一致
@@ -58,60 +63,112 @@ jobs:
           java-version: '17'
           cache: maven
 
-      # ⑥ 构建后端 jar（跳过后端自带测试，避免与本次自动化测试混淆）
+      # ⑥ 等待 MySQL 就绪
+      #    容器的 healthcheck 只保证容器活着，这里再用 mysqladmin ping 主动确认可连接，
+      #    避免后续建表/导入数据时因“数据库还没准备好”而偶发失败
+      - name: 等待 MySQL 就绪
+        run: |
+          # 最多重试 30 次，每次间隔 2 秒（合计最长约 60 秒）
+          for i in $(seq 1 30); do
+            if mysqladmin ping -h 127.0.0.1 -P 3306 -uapartment -p123456 --silent; then
+              echo "MySQL 已就绪（第 ${i} 次探测成功）"
+              exit 0
+            fi
+            echo "第 ${i} 次探测：MySQL 尚未就绪，2 秒后重试..."
+            sleep 2
+          done
+          # 超时则直接失败，避免带着“连不上数据库”的状态继续跑用例
+          echo "MySQL 等待超时（60 秒）"; exit 1
+
+      # ⑦ 导入数据库结构与种子数据
+      #    必须先建表再插数据：后端 JPA 虽然是 ddl-auto=update 会自动建表，
+      #    但那样只能建出空表，房源等业务数据缺失会导致用例失败，
+      #    因此这里在启动后端之前就把表结构和测试数据准备好
+      - name: 导入数据库结构与种子数据
+        run: |
+          # 建表：含 users / apartments / appointments / contracts / payments
+          echo "== 导入 schema.sql（建表，可重复执行）=="
+          mysql -h127.0.0.1 -P3306 -uapartment -p123456 --default-character-set=utf8mb4 \
+            apartment_rental_db < test/sql/schema.sql
+          # 种子数据：用户、3 条房源、合同与流水、1 条历史预约（幂等，可重复执行）
+          echo "== 导入 data.sql（种子数据，幂等）=="
+          mysql -h127.0.0.1 -P3306 -uapartment -p123456 --default-character-set=utf8mb4 \
+            apartment_rental_db < test/sql/data.sql
+          # 打印导入结果，便于在 Actions 日志中快速核对（房源与用户数量）
+          echo "== 数据核对 =="
+          mysql -h127.0.0.1 -P3306 -uapartment -p123456 --default-character-set=utf8mb4 \
+            apartment_rental_db -e "SELECT COUNT(*) AS 用户数 FROM users; SELECT id, name, status FROM apartments ORDER BY id;"
+
+      # ⑧ 构建后端 jar（跳过后端自带测试，避免与本次自动化测试混淆）
       - name: 构建后端
         run: mvn -q -DskipTests package
         working-directory: backend
-        # 若后端无法构建（如缺少依赖下载权限），允许继续，后续测试会明确失败
+        # 若后端无法构建（如缺少依赖下载权限），允许继续，后续“启动后端”步骤会明确失败
         continue-on-error: true
 
-      # ⑦ 后台启动后端并等待 8080 端口就绪
-      #    说明：后端使用 JPA ddl-auto=update 自动建表，DataInitializer 自动初始化账号
-      - name: 启动后端服务
+      # ⑨ 后台启动后端，并阻塞等待 8080 端口可访问
+      #    说明：后端使用 JPA ddl-auto=update，对已由 schema.sql 建好的表不会产生额外变更
+      - name: 启动后端服务并等待就绪
         run: |
+          # 后台启动；日志写入 backend.log 便于排查
           nohup java -jar target/*.jar > backend.log 2>&1 &
-          # 最多等待 60 秒，直到 8080 端口可用
-          for i in $(seq 1 60); do
+          # /api/auth/login 是 POST 接口，GET 探测会返回 405，
+          # 但只要能拿到 HTTP 响应就说明服务已经起来了（curl 默认不会因 405 而报错）
+          for i in $(seq 1 30); do
             if curl -s -o /dev/null http://localhost:8080/api/auth/login; then
-              echo "后端已启动"; exit 0
+              echo "后端已就绪（第 ${i} 次探测成功）"; exit 0
             fi
-            sleep 1
+            echo "第 ${i} 次探测：后端尚未就绪，2 秒后重试..."
+            sleep 2
           done
-          echo "后端启动超时，输出日志："; tail -n 100 backend.log; exit 1
+          echo "后端启动超时（60 秒），输出日志："; tail -n 100 backend.log; exit 1
         working-directory: backend
-        continue-on-error: true
+        # 不再吞掉启动失败：服务起不来时应在这一步明确报错，而不是拖到用例里变成“连接被拒绝”
 
-      # ⑧ 后台启动前端（UI 用例依赖 5173 端口）
-      - name: 启动前端服务
+      # ⑩ 后台启动前端 Vite，并阻塞等待 5173 端口可访问
+      #    之前的写法虽然用了 nohup，但没有记录 PID、也没有在启动失败时暴露日志，
+      #    导致 UI 用例报 net::ERR_CONNECTION_REFUSED 时难以定位；这里补齐
+      - name: 启动前端服务并等待就绪
         run: |
+          # 安装前端依赖（首次运行或缓存失效时耗时较长）
           npm install --no-audit --no-fund
-          nohup npm run dev -- --port 5173 > frontend.log 2>&1 &
-          for i in $(seq 1 60); do
+          # 后台运行 Vite：--host 0.0.0.0 允许外部访问；--strictPort 保证端口必须是 5173，
+          # 若 5173 被占用则直接失败，避免 Vite 自动切到 5174 后 UI 用例仍然连 5173
+          nohup npm run dev -- --host 0.0.0.0 --port 5173 --strictPort > /tmp/frontend.log 2>&1 &
+          # 记录后台进程 PID，便于后续排查与（必要时）清理
+          echo $! > /tmp/frontend.pid
+          echo "前端进程 PID：$(cat /tmp/frontend.pid)"
+          # 最多重试 30 次，每次间隔 2 秒，直到 5173 能返回 HTTP 响应
+          for i in $(seq 1 30); do
             if curl -s -o /dev/null http://localhost:5173; then
-              echo "前端已启动"; exit 0
+              echo "前端已就绪（第 ${i} 次探测成功）"; break
             fi
-            sleep 1
+            echo "第 ${i} 次探测：前端尚未就绪，2 秒后重试..."
+            sleep 2
           done
-          echo "前端启动超时"; tail -n 100 frontend.log; exit 1
+          # 打印前端日志，无论成功失败都输出，便于在 Actions 中排查 Vite 启动问题
+          echo "===== 前端启动日志 /tmp/frontend.log ====="
+          cat /tmp/frontend.log
+          # 最终确认：若 5173 仍不可达则明确失败，避免 UI 用例报 ERR_CONNECTION_REFUSED 时才暴露问题
+          curl -s -o /dev/null http://localhost:5173 || { echo "前端启动失败：5173 不可访问"; exit 1; }
         working-directory: frontend
-        continue-on-error: true
 
-      #  执行冒烟测试（接口 + UI + 数据库校验核心链路）
-      #    无头模式：HEADLESS=true；数据库连接信息通过环境变量传入
+      # ⑪ 执行冒烟测试（接口 + UI + 数据库校验核心链路）
+      #    无头模式：HEADLESS=true；服务与数据库连接信息均通过环境变量传入
       - name: 运行冒烟测试
         run: pytest -m smoke
         working-directory: test/automation
         env:
-          HEADLESS: "true"
-          BASE_URL: http://localhost:8080
-          UI_BASE_URL: http://localhost:5173
-          DB_HOST: 127.0.0.1
+          HEADLESS: "true"                          # Playwright 无头模式（CI 无显示器）
+          BASE_URL: http://localhost:8080           # 后端地址
+          UI_BASE_URL: http://localhost:5173        # 前端地址（UI 用例使用）
+          DB_HOST: 127.0.0.1                        # 数据库地址（db 用例使用）
           DB_PORT: "3306"
           DB_NAME: apartment_rental_db
           DB_USER: apartment
           DB_PASSWORD: "123456"
 
-      # ⑩ 上传 Allure 原始结果（供本地 allure serve 或后续生成报告）
+      # ⑫ 上传 Allure 原始结果（供本地 allure serve 或后续生成报告）
       - name: 上传 Allure 结果
         if: always()
         uses: actions/upload-artifact@v4
@@ -120,7 +177,7 @@ jobs:
           path: test/automation/allure-results
           if-no-files-found: warn
 
-      # ⑪ 上传 UI 失败截图（不存在时忽略，避免误报失败）
+      # ⑬ 上传 UI 失败截图（不存在时忽略，避免误报失败）
       - name: 上传失败截图
         if: always()
         uses: actions/upload-artifact@v4
@@ -129,7 +186,7 @@ jobs:
           path: test/automation/screenshots
           if-no-files-found: ignore
 
-      # ⑫ 上传 Playwright trace（不存在时忽略）
+      # ⑭ 上传 Playwright trace（不存在时忽略）
       - name: 上传 Playwright trace
         if: always()
         uses: actions/upload-artifact@v4
