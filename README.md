@@ -1,3 +1,4 @@
+[![自动化测试](https://github.com/MiFan-Nuiq/Apartment-rental/actions/workflows/auto-test.yml/badge.svg?branch=main)](https://github.com/MiFan-Nuiq/Apartment-rental/actions/workflows/auto-test.yml)
 # 公寓租赁管理系统 · 测试项目
 
 本项目为「公寓租赁管理系统」的测试专项工程，覆盖**手工测试用例、接口自动化、数据库一致性校验、UI 自动化、缺陷管理**五个维度，用于毕业设计的测试作品集展示与日后回归验证。
