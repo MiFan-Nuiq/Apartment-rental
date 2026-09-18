@@ -269,22 +269,82 @@ mysql --host=127.0.0.1 --port=3306 --user=apartment --password=123456 `
 > 而不是直接 `mysqldump` 全量导出——因为本地库里含 `BUG-DATA-001` 等脏数据，
 > 全量导出会把脏数据带进 CI，一致性用例②就再也无法通过。
 
-### 12.2 CI 前端启动方式（本次修复重点）
+### 12.2 CI 前端依赖安装注意事项（本次修复重点）
 
-早期写法只有 `nohup npm run dev &`，没有记录 PID、没有等待就绪、失败日志也被 `continue-on-error` 吞掉，
-于是 UI 用例只表现为 `net::ERR_CONNECTION_REFUSED at http://localhost:5173/login`，很难定位。
-现在改为：
+#### 12.2.1 故障现象与真正的根因
 
-```bash
-npm install --no-audit --no-fund                       # 先装依赖
-nohup npm run dev -- --host 0.0.0.0 --port 5173 --strictPort > /tmp/frontend.log 2>&1 &
-echo $! > /tmp/frontend.pid                            # 记录 PID，便于排查
-# 循环 curl http://localhost:5173，最多 30 次 × 2 秒
-# 之后 cat /tmp/frontend.log 打印日志，并再次确认 5173 可访问，否则本步骤直接失败
+CI 日志里的三个现象是**同一条因果链**：
+
+```
+npm install --no-audit --no-fund   -> "added 3 packages in 3s"（明显没装全）
+nohup npm run dev ...              -> /tmp/frontend.log: "sh: 1: vite: Permission denied"
+30 次探测 5173                      -> 全部失败，最终 exit 1
 ```
 
+> **根因不是 `NODE_ENV=production`**（本仓库未设置该变量，也确认过没有 `.npmrc`）。
+
+真正的原因是：**`frontend/node_modules` 被提交进了 git**。
+
+| 事实 | 数据 |
+| --- | --- |
+| `frontend/node_modules` 被 git 跟踪的文件数 | **12941** |
+| `backend/target` 被跟踪的文件数 | 129 |
+| 仓库总跟踪文件数 | 13644（**95.8% 是构建产物**） |
+| `git ls-files -s frontend/node_modules/.bin/vite` 的权限位 | **`100644`**（没有可执行位） |
+
+链条如下：
+
+1. 这些文件是在 **Windows** 上提交的，git 记录的权限位是 `100644`；
+2. `actions/checkout` 在 Linux 上按该权限位还原 → `node_modules/.bin/vite` **不可执行**；
+3. `npm install` 看到依赖树"已满足"，只补装 3 个缺失包就退出（3 秒完成），**根本不会修复权限位**；
+4. `npm run dev` 通过 `sh` 执行 `.bin/vite` → `sh: 1: vite: Permission denied`。
+
+同时，从 Windows 提交的 `node_modules` 也**不含 Linux 平台的原生二进制**（如 `@esbuild/linux-x64`），
+即使绕过权限问题，Vite 仍可能因 esbuild 平台不匹配而启动失败。
+
+#### 12.2.2 修复动作
+
+**① 仓库层面：新增 [.gitignore](../../.gitignore)**，忽略 `node_modules/`、`target/`、`dist/` 等，
+防止依赖目录与构建产物再次被提交（`node_modules` 必须由 CI 自己安装，绝不能入库）。
+
+**② workflow 层面：`安装前端依赖` 步骤改为**
+
+```bash
+# 环境诊断（先打印 Node/npm 版本与 npm 配置，便于在 Actions 日志里直接定位）
+node -v ; npm -v
+npm config get production     # 若为 true 会跳过 devDependencies
+npm config get omit           # 若含 dev 同样会跳过 devDependencies
+cat package.json              # 确认 vite 在 devDependencies（本仓库已确认在，无需修改）
+
+rm -rf node_modules           # 关键：删掉被 git 带进来的 Windows 版依赖树
+npm install --include=dev --no-audit --no-fund   # 显式安装 devDependencies，确保 vite 装上
+chmod -R +x node_modules/.bin || true            # 补齐 .bin 下 shim 的可执行权限
+# 校验 node_modules/vite/bin/vite.js 存在，不存在则立即失败并给出原因
+```
+
+**③ workflow 层面：启动命令改为直接用 node 执行 vite 入口**
+
+```bash
+nohup node node_modules/vite/bin/vite.js --host 0.0.0.0 --port 5173 --strictPort > /tmp/frontend.log 2>&1 &
+echo $! > /tmp/frontend.pid                    # 记录 PID
+# 循环 curl http://localhost:5173，最多 30 次 × 2 秒
+# cat /tmp/frontend.log 打印日志，并再次确认 5173 可访问，否则本步骤直接失败
+```
+
+三种启动方式的兼容性对比（本项目选第三种）：
+
+| 启动方式 | 是否受 `.bin` 权限问题影响 | 说明 |
+| --- | --- | --- |
+| `npm run dev` | **会** | 走 `node_modules/.bin/vite` 的 sh shim，正是本次报错的入口 |
+| `npx --no-install vite` | **会** | `npx` 最终仍去执行 `.bin` 下的 shim，同样可能 `Permission denied` |
+| `node node_modules/vite/bin/vite.js` | **不会** | 只依赖 `node` 本身，彻底绕开 shim 与 `PATH`，兼容性最好 |
+
+#### 12.2.3 其他要点
+
 - `--strictPort`：5173 被占用时**直接失败**，避免 Vite 自动切到 5174、UI 用例却仍连 5173；
-- 去掉了该步骤的 `continue-on-error`：服务起不来就在该步骤明确报错，不再拖到用例里变成"连接被拒绝"；
+- `安装前端依赖` 与 `启动前端服务` 两个步骤都用 `working-directory: frontend`，
+  `cat package.json`、`rm -rf node_modules` 等相对路径均相对于 `frontend/` 执行（任务四）；
+- 去掉了启动步骤的 `continue-on-error`：服务起不来就在该步骤明确报错，不再拖到用例里变成"连接被拒绝"；
 - 后端启动步骤同样加了 `curl` 就绪等待（`/api/auth/login` 是 POST 接口，GET 探测返回 405 也算服务已就绪）。
 
 ### 12.3 其他说明
@@ -360,9 +420,60 @@ allure generate allure-results -o allure-report --clean   # 或生成静态报�
       ① 原生命令参数里的点号会被拆开（`-h127.0.0.1` 失效），要改用 `--host=127.0.0.1`；
       ② 不支持 `<` 输入重定向，要改用 `mysql --execute="source xxx.sql"`。
 
+### 7. 仓库瘦身：把 node_modules / target 从 git 中移除（**强烈建议，优先级最高**）
+
+workflow 里的 `rm -rf node_modules` 只是**兜底绕过**，让 CI 不再被污染；
+但仓库里仍然跟踪着 **12941 个 `node_modules` 文件 + 129 个 `backend/target` 文件**。
+只要它们还在 git 里，就会出现"本地删了又被 checkout 回来""仓库 clone 极慢""跨平台权限位反复出问题"。
+
+我已新增 `.gitignore`，剩下这一步需要你手动执行（**属于 git 索引操作，涉及一次大批量提交，需你确认后再做**）：
+
+```bash
+# 1) 从 git 索引中移除依赖目录与构建产物（--cached 表示只删索引，不动本地文件）
+git rm -r --cached frontend/node_modules
+git rm -r --cached backend/target
+
+# 2) 确认 .gitignore 生效（应输出路径，表示已被忽略）
+git check-ignore -v frontend/node_modules backend/target
+
+# 3) 提交这次清理（提交后仓库跟踪文件会从 13644 降到约 570）
+git add .gitignore
+git commit -m "chore: 忽略并移除误提交的 node_modules 与 target 构建产物"
+
+# 4) 推送
+git push
+```
+
+> 若希望进一步减小仓库体积（历史提交里仍有这些大文件），需要重写历史（`git filter-repo` 或
+> BFG Repo-Cleaner），属于破坏性操作，**务必先备份**，可参考但不强制。
+
+> ⚠️ **`.gitignore` 语法坑**：它**只支持整行注释**（`#` 必须在行首），
+> **不支持行尾注释**——`node_modules/    # 说明` 这种写法会让整行变成一个无效模式，规则静默失效。
+> 本项目的 `.gitignore` 已按正确写法组织（说明单独占一行），修改时请勿改成行尾注释。
+> 验证规则是否生效：`git check-ignore -v --no-index frontend/node_modules`（应回显命中的规则行号）。
+
+### 8. 依赖安装完成后的人工确认
+- [ ] 先执行 `git rm -r --cached` 清理（见第 7 节）再推送，否则 CI 每次仍会检出 12,941 个污染文件。
+- [ ] 推送后在 Actions 日志里确认 `安装前端依赖` 步骤打印的 `npm config production` **不是 `true`**。
+- [ ] 首次 CI 通过后，建议在本地也执行一次干净安装（见下方"本地验证命令"），确认 `vite` 可正常启动。
+
 ## 十五、运行记录
 
-### 15.1 本次 CI 失败修复的验证（2026-09-18）
+### 15.1 前端启动失败修复的验证（2026-09-18，最新）
+
+修复对象：CI 中 `启动前端服务并等待就绪` 步骤失败
+（`npm install` 只装 3 个包 → `sh: 1: vite: Permission denied` → 5173 探测 30 次全失败）。
+
+| 验证项 | 命令 / 方式 | 实际结果 |
+| --- | --- | --- |
+| 根因定位 | `git ls-files -s frontend/node_modules/.bin/vite` | 权限位为 **100644**，确认无可执行位 |
+| 误提交规模 | `git ls-files \| Measure-Object` | node_modules 12941 + target 129 = 13644 个跟踪文件中占 95.8% |
+| package.json 检查 | 读取 `frontend/package.json` | `vite`、`@vitejs/plugin-vue` **已在 devDependencies**，无需修改 |
+| 新的启动命令 | `node frontend/node_modules/vite/bin/vite.js --version` | 输出 `vite/5.4.21 node-v24.15.0`，exit 0 |
+| workflow YAML 语法 | `yaml.safe_load(auto-test.yml)` | 通过，共 **15 个步骤** |
+| workflow 内所有 shell 脚本 | `bash -n`（Git Bash 逐个校验 9 个 run 块） | 全部 `[OK]`，失败数 0 |
+
+### 15.2 数据库与服务启动修复的验证（2026-09-18）
 
 修复对象：CI 中失败的 4 个 `pytest -m smoke` 用例
 （`test_query_apartments` / `test_submit_appointment` / `test_full_flow` / `test_ui_login`）。
@@ -377,7 +488,7 @@ allure generate allure-results -o allure-report --clean   # 或生成静态报�
 | 数据库用例 | `pytest -m db` | 3 passed, 1 xfailed（4 selected） |
 | workflow 语法 | `yaml.safe_load(auto-test.yml)` | 校验通过，14 个步骤顺序正确 |
 
-### 15.2 历史运行记录（2026-09-16）
+### 15.3 历史运行记录（2026-09-16）
 
 | 执行命令 | 实际结果 |
 | --- | --- |

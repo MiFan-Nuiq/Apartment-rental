@@ -125,16 +125,64 @@ jobs:
         working-directory: backend
         # 不再吞掉启动失败：服务起不来时应在这一步明确报错，而不是拖到用例里变成“连接被拒绝”
 
-      # ⑩ 后台启动前端 Vite，并阻塞等待 5173 端口可访问
-      #    之前的写法虽然用了 nohup，但没有记录 PID、也没有在启动失败时暴露日志，
-      #    导致 UI 用例报 net::ERR_CONNECTION_REFUSED 时难以定位；这里补齐
+      # ⑩-1 安装前端依赖（含环境诊断）
+      #      本次修复的核心。CI 报错链条是：
+      #        npm install -> "added 3 packages in 3s"（没装全）
+      #        npm run dev -> "sh: 1: vite: Permission denied"（vite 不可执行）
+      #        5173 探测 30 次全失败 -> exit 1
+      #      真正的根因不是 NODE_ENV=production，而是 frontend/node_modules 被误提交进 git：
+      #      仓库里 node_modules/.bin/vite 的权限位为 100644（从 Windows 提交，缺少可执行位），
+      #      CI 检出后该 shim 无法执行；而 npm install 认为依赖树“已满足”，
+      #      只补装 3 个缺失包就退出，根本不会去修复这个权限位。
+      #      因此必须先删掉被 git 带进来的 node_modules，让 npm 在 Linux 上重新干净安装。
+      - name: 安装前端依赖
+        run: |
+          # ---------- 环境诊断：把 CI 真实环境打印出来，便于在 Actions 日志里直接定位问题 ----------
+          echo "===== 环境诊断 ====="
+          node -v                                                    # Node 版本
+          npm -v                                                     # npm 版本
+          echo "npm config production = $(npm config get production)"  # 若为 true，npm 会跳过 devDependencies
+          echo "npm config omit       = $(npm config get omit)"        # 若含 dev，同样会跳过 devDependencies
+          echo "NODE_ENV = ${NODE_ENV:-（未设置）}"                     # 未设置才能保证 devDependencies 不被裁剪
+          echo "当前工作目录：$(pwd)"                                   # 确认在 frontend 目录下执行（任务四）
+          echo "----- package.json -----"
+          cat package.json                                           # 确认 vite 与 @vitejs/plugin-vue 在 devDependencies
+
+          # ---------- 清理被 git 带进来的 Windows 版依赖树 ----------
+          # 这些文件从 Windows 提交上来：既没有可执行权限，也不会包含 Linux 平台的原生二进制
+          # （例如 esbuild 的 linux-x64 包），必须整体删除后重装
+          rm -rf node_modules
+
+          # ---------- 安装全部依赖，显式包含 devDependencies ----------
+          # --include=dev 会覆盖可能存在的 production / omit=dev 配置，确保 vite 被真正装上
+          npm install --include=dev --no-audit --no-fund
+
+          # ---------- 修复 .bin 目录的可执行权限 ----------
+          # npm 在跨平台提交、缓存恢复等场景下不会给 .bin 下的 shim 补 +x，
+          # 这里统一补上，避免 "sh: 1: vite: Permission denied"；失败也不中断（|| true）
+          chmod -R +x node_modules/.bin || true
+
+          # ---------- 安装结果校验：vite 入口必须存在，否则立刻失败并给出明确原因 ----------
+          if [ ! -f node_modules/vite/bin/vite.js ]; then
+            echo "前端依赖安装失败：找不到 node_modules/vite/bin/vite.js"
+            echo "请检查 package.json 中 vite 是否声明在 devDependencies，以及 npm 是否处于 production 模式"
+            exit 1
+          fi
+          echo "vite 入口已就绪：$(ls -l node_modules/vite/bin/vite.js)"
+          echo "vite 版本：$(node node_modules/vite/bin/vite.js --version)"
+        working-directory: frontend
+
+      # ⑩-2 后台启动前端 Vite，并阻塞等待 5173 端口可访问
+      #      改用 node 直接执行 vite 入口文件，而不是 npm run dev / npx / .bin shim，
+      #      三种启动方式的兼容性对比：
+      #        npm run dev          -> 走 node_modules/.bin/vite 的 shim，最容易被权限位问题卡住
+      #        npx --no-install     -> 最终仍去执行 .bin 下的 shim，同样可能 Permission denied
+      #        node node_modules/vite/bin/vite.js  -> 只依赖 node 本身，彻底绕开 shim 与 PATH（本项目选用）
       - name: 启动前端服务并等待就绪
         run: |
-          # 安装前端依赖（首次运行或缓存失效时耗时较长）
-          npm install --no-audit --no-fund
-          # 后台运行 Vite：--host 0.0.0.0 允许外部访问；--strictPort 保证端口必须是 5173，
+          # --host 0.0.0.0 允许外部访问；--strictPort 保证端口必须是 5173，
           # 若 5173 被占用则直接失败，避免 Vite 自动切到 5174 后 UI 用例仍然连 5173
-          nohup npm run dev -- --host 0.0.0.0 --port 5173 --strictPort > /tmp/frontend.log 2>&1 &
+          nohup node node_modules/vite/bin/vite.js --host 0.0.0.0 --port 5173 --strictPort > /tmp/frontend.log 2>&1 &
           # 记录后台进程 PID，便于后续排查与（必要时）清理
           echo $! > /tmp/frontend.pid
           echo "前端进程 PID：$(cat /tmp/frontend.pid)"

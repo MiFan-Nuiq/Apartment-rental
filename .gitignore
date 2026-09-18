@@ -1,0 +1,62 @@
+# ============================================================================
+# .gitignore —— 忽略构建产物与依赖目录
+#
+# 为什么必须加这个文件：
+#   本仓库此前没有 .gitignore，导致 frontend/node_modules（12941 个文件）和
+#   backend/target（129 个文件）被误提交进 git，占全部跟踪文件的 95% 以上。
+#   其中 frontend/node_modules/.bin/vite 的 git 权限位是 100644（从 Windows 提交，
+#   没有可执行位），CI 在 Linux 上检出后执行 npm run dev 就会报
+#   "sh: 1: vite: Permission denied"，这就是前端在 CI 启动失败的根因。
+#
+# 语法提醒（很重要）：
+#   .gitignore 只支持「整行注释」，即 # 必须出现在行首；
+#   不支持行尾注释——写在模式后面的 # xxx 会被当成模式的一部分，导致该规则完全失效。
+#   因此本文件所有说明都单独占一行。
+# ============================================================================
+
+# ---------- Node / 前端 ----------
+# npm 依赖目录：必须忽略，且不可提交（跨平台提交会丢失可执行权限）
+node_modules/
+# 前端构建产物
+dist/
+# Vite 依赖预构建缓存
+.vite/
+# npm / yarn 调试日志
+npm-debug.log*
+yarn-error.log*
+yarn-debug.log*
+# pnpm 本地仓库
+.pnpm-store/
+
+# ---------- Java / 后端 ----------
+# Maven 构建产物目录
+target/
+# 打包出的 jar（CI 每次重新构建）
+*.jar
+# 编译产物
+*.class
+
+# ---------- Python / 自动化测试 ----------
+# Python 字节码缓存
+__pycache__/
+*.py[cod]
+# pytest 缓存
+.pytest_cache/
+# Allure 原始结果（CI 作为 artifact 上传，不入库）
+test/automation/allure-results/
+# Allure 静态 HTML 报告（本地生成，不入库）
+test/automation/allure-report/
+# UI 失败截图（运行期产物）
+test/automation/screenshots/
+# Playwright trace（运行期产物）
+test/automation/traces/
+
+# ---------- IDE / 操作系统 ----------
+# JetBrains 系列工程文件
+.idea/
+# IntelliJ 模块文件
+*.iml
+# macOS 目录属性文件
+.DS_Store
+# Windows 缩略图缓存
+Thumbs.db
