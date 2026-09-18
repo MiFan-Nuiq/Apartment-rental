@@ -1,0 +1,139 @@
+# GitHub Actions 工作流 —— 公寓租赁管理系统自动化测试
+# 说明：push / pull_request 时自动执行冒烟测试，并上传 Allure 结果与 UI 失败截图/trace
+# 注意：首次使用需人工在 GitHub 仓库确认 Actions 已开启（见 README「需要人工完成的事项」）
+
+name: 自动化测试
+
+# 触发条件：推送代码、提交 PR，以及支持手动触发
+on:
+  push:
+  pull_request:
+  workflow_dispatch:      # 支持在 GitHub 页面手动点击运行
+
+jobs:
+  test:
+    # 使用最新的 Ubuntu 运行器（已预装 Maven 与 Java）
+    runs-on: ubuntu-latest
+
+    # MySQL 服务容器：为后端提供数据库，库名/账号与 application.yml 默认值保持一致
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: root                  # root 密码（仅 CI 内使用）
+          MYSQL_DATABASE: apartment_rental_db         # 自动创建业务库
+          MYSQL_USER: apartment                       # 业务账号（对齐 application.yml）
+          MYSQL_PASSWORD: "123456"                    # 业务密码（对齐 application.yml）
+        ports:
+          - 3306:3306                                 # 暴露端口供后端连接
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1" --health-interval=10s
+          --health-timeout=5s --health-retries=10
+
+    steps:
+      # ① 拉取代码
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      # ② 安装 Python 3.11 并开启 pip 缓存
+      - name: 安装 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      # ③ 安装自动化测试依赖（路径已加 test/automation 前缀）
+      - name: 安装测试依赖
+        run: pip install -r test/automation/requirements.txt
+
+      # ④ 安装 Playwright 的 Chromium 浏览器（UI 用例依赖）
+      - name: 安装 Playwright 浏览器
+        run: playwright install --with-deps chromium
+
+      # ⑤ 安装 Java 17（后端 Spring Boot 运行环境）
+      - name: 安装 Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: maven
+
+      # ⑥ 构建后端 jar（跳过后端自带测试，避免与本次自动化测试混淆）
+      - name: 构建后端
+        run: mvn -q -DskipTests package
+        working-directory: backend
+        # 若后端无法构建（如缺少依赖下载权限），允许继续，后续测试会明确失败
+        continue-on-error: true
+
+      # ⑦ 后台启动后端并等待 8080 端口就绪
+      #    说明：后端使用 JPA ddl-auto=update 自动建表，DataInitializer 自动初始化账号
+      - name: 启动后端服务
+        run: |
+          nohup java -jar target/*.jar > backend.log 2>&1 &
+          # 最多等待 60 秒，直到 8080 端口可用
+          for i in $(seq 1 60); do
+            if curl -s -o /dev/null http://localhost:8080/api/auth/login; then
+              echo "后端已启动"; exit 0
+            fi
+            sleep 1
+          done
+          echo "后端启动超时，输出日志："; tail -n 100 backend.log; exit 1
+        working-directory: backend
+        continue-on-error: true
+
+      # ⑧ 后台启动前端（UI 用例依赖 5173 端口）
+      - name: 启动前端服务
+        run: |
+          npm install --no-audit --no-fund
+          nohup npm run dev -- --port 5173 > frontend.log 2>&1 &
+          for i in $(seq 1 60); do
+            if curl -s -o /dev/null http://localhost:5173; then
+              echo "前端已启动"; exit 0
+            fi
+            sleep 1
+          done
+          echo "前端启动超时"; tail -n 100 frontend.log; exit 1
+        working-directory: frontend
+        continue-on-error: true
+
+      #  执行冒烟测试（接口 + UI + 数据库校验核心链路）
+      #    无头模式：HEADLESS=true；数据库连接信息通过环境变量传入
+      - name: 运行冒烟测试
+        run: pytest -m smoke
+        working-directory: test/automation
+        env:
+          HEADLESS: "true"
+          BASE_URL: http://localhost:8080
+          UI_BASE_URL: http://localhost:5173
+          DB_HOST: 127.0.0.1
+          DB_PORT: "3306"
+          DB_NAME: apartment_rental_db
+          DB_USER: apartment
+          DB_PASSWORD: "123456"
+
+      # ⑩ 上传 Allure 原始结果（供本地 allure serve 或后续生成报告）
+      - name: 上传 Allure 结果
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: allure-results
+          path: test/automation/allure-results
+          if-no-files-found: warn
+
+      # ⑪ 上传 UI 失败截图（不存在时忽略，避免误报失败）
+      - name: 上传失败截图
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: screenshots
+          path: test/automation/screenshots
+          if-no-files-found: ignore
+
+      # ⑫ 上传 Playwright trace（不存在时忽略）
+      - name: 上传 Playwright trace
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: traces
+          path: test/automation/traces
+          if-no-files-found: ignore

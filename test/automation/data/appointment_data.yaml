@@ -1,0 +1,40 @@
+# 看房预约接口数据驱动用例集
+# 说明：由 testcases/test_login_ddt.py（TestAppointmentDDT）读取并参数化执行。
+# 字段含义：
+#   id            用例唯一标识
+#   title         中文用例标题（写入 Allure 报告）
+#   payload       预约请求数据（snake_case，测试代码会映射为后端要求的驼峰结构）
+#   expect_success 是否期望提交成功（True=应返回 code 200 且状态为“待处理”；False=应返回非 200）
+# 关联字段说明（对齐后端 Appointment 实体 / appointments 表）：
+#   apartment_id 房源ID、tenant_id 租户ID、landlord_id 房东ID、appointment_time 预约时间、remark 备注
+
+cases:
+  - id: appointment_success
+    title: 正常预约：字段完整且房源有效，提交成功
+    payload:
+      apartment_id: 3
+      tenant_id: 3
+      landlord_id: 2
+      appointment_time: "2026-10-01 10:00:00"
+      remark: "数据驱动-正常预约"
+    expect_success: true
+
+  - id: appointment_missing_field
+    title: 异常预约：缺失必填的预约时间，提交失败
+    payload:
+      apartment_id: 3
+      tenant_id: 3
+      landlord_id: 2
+      # 故意不提供 appointment_time，验证后端必填校验
+      remark: "数据驱动-缺失预约时间"
+    expect_success: false
+
+  - id: appointment_invalid_apartment
+    title: 异常预约：房源ID不存在，提交失败
+    payload:
+      apartment_id: 999999
+      tenant_id: 3
+      landlord_id: 2
+      appointment_time: "2026-10-02 10:00:00"
+      remark: "数据驱动-无效房源ID"
+    expect_success: false

@@ -116,8 +116,9 @@ class TestCoreFlow:
     @allure.title("预约：携带 token 提交预约成功且状态为待处理")
     @pytest.mark.api
     @pytest.mark.smoke
-    def test_submit_appointment(self, api_client, auth_headers, appointment_data):
-        """验证携带 token 提交预约成功，新预约状态默认'待处理'。"""
+    @pytest.mark.db
+    def test_submit_appointment(self, api_client, auth_headers, appointment_data, db_connection):
+        """验证携带 token 提交预约成功，且数据库落库记录与接口返回一致。"""
         # 步骤一：调用提交预约接口
         with allure.step("提交预约请求"):
             resp = create_appointment(
@@ -132,7 +133,7 @@ class TestCoreFlow:
             assert_status_code(resp, 200)
             assert_business_code(resp, 200)
 
-        # 步骤二：校验预约创建结果
+        # 步骤二：校验预约创建结果（接口返回）
         with allure.step("校验预约返回字段与状态"):
             data = resp.json().get("data")
             assert data is not None, "提交预约返回 data 为空"
@@ -141,9 +142,34 @@ class TestCoreFlow:
             assert_field_equal(data, "status", "待处理")
             assert_field_equal(data, "remark", appointment_data["remark"])
 
+        # 步骤三：数据库校验——查询 appointments 表最新记录，与接口返回交叉比对
+        with allure.step("数据库校验：appointments 表最新记录与接口返回一致"):
+            # 取最新一条记录（id 自增，最大 id 即本次接口新建的记录）
+            # 注意：appointments 表实际字段为 tenant_id / landlord_id，并无 user_id 列
+            row = db_connection.query_one(
+                "SELECT id, apartment_id, tenant_id, landlord_id, status, remark "
+                "FROM appointments ORDER BY id DESC LIMIT 1"
+            )
+            assert row is not None, "appointments 表未查询到任何记录，接口可能未真正落库"
+            assert row["id"] == data["id"], f"数据库最新记录 id={row['id']} 与接口返回 id={data['id']} 不一致"
+            assert row["apartment_id"] == appointment_data["apartment_id"], (
+                f"数据库 apartment_id={row['apartment_id']} 与提交的 {appointment_data['apartment_id']} 不一致"
+            )
+            assert row["tenant_id"] == appointment_data["tenant_id"], (
+                f"数据库 tenant_id={row['tenant_id']} 与提交的 {appointment_data['tenant_id']} 不一致"
+            )
+            assert row["landlord_id"] == appointment_data["landlord_id"], (
+                f"数据库 landlord_id={row['landlord_id']} 与提交的 {appointment_data['landlord_id']} 不一致"
+            )
+            assert row["status"] == "待处理", f"数据库预约状态应为'待处理'，实际：{row['status']}"
+            assert row["remark"] == appointment_data["remark"], (
+                f"数据库 remark={row['remark']} 与提交的 {appointment_data['remark']} 不一致"
+            )
+
     @allure.title("端到端主流程：登录 -> 房源查询 -> 提交预约")
     @pytest.mark.api
     @pytest.mark.smoke
+    @pytest.mark.slow
     def test_full_flow(self, api_client, auth_headers, appointment_data):
         """端到端连贯执行登录、房源查询、预约提交，验证 token 在链路中有效传递。"""
         # 步骤一：房源查询
