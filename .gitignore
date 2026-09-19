@@ -51,6 +51,17 @@ test/automation/screenshots/
 # Playwright trace（运行期产物）
 test/automation/traces/
 
+# ---------- Docker ----------
+# 本地环境变量文件：可能含真实密码，只提交模板 .env.example，绝不提交 .env
+.env
+# 各目录下的 .env 变体（如 frontend/.env.local）
+.env.local
+.env.*.local
+# 若把 MySQL 数据卷改成了 bind mount 到项目目录，则该目录不入库
+mysql-data/
+# Docker 构建日志等临时文件
+*.docker.log
+
 # ---------- IDE / 操作系统 ----------
 # JetBrains 系列工程文件
 .idea/

@@ -1,0 +1,59 @@
+# ============================================================================
+# frontend/.dockerignore —— 前端构建上下文排除清单
+#
+# 作用：
+#   指定 docker build 时「不发送给 Docker 守护进程」的文件。
+#   其中最关键的是 node_modules：
+#     本机的 node_modules 是在 Windows 上安装的，既没有 Linux 平台的原生二进制
+#     （如 @esbuild/linux-x64、rollup 的 linux 版本），跨平台拷贝还会丢失 .bin 的
+#     可执行权限位——CI 曾因此报 "sh: 1: vite: Permission denied"。
+#     因此必须排除，让镜像内重新执行 npm install 装出 Linux 版依赖。
+#
+# 语法提醒：.dockerignore 只支持「整行注释」，即 # 必须位于行首。
+# ============================================================================
+
+# ---------- 依赖目录 ----------
+# npm 依赖：必须在镜像内重新安装，不可复用本机（Windows）版本
+node_modules/
+
+# ---------- 构建与缓存产物 ----------
+# vite build 的产物，测试用的是 dev server，不需要
+dist/
+# Vite 依赖预构建缓存
+.vite/
+# 各类包管理器缓存与调试日志
+npm-debug.log*
+yarn-error.log*
+yarn-debug.log*
+.pnpm-store/
+
+# ---------- 版本控制与 IDE ----------
+# git 元数据与历史
+.git/
+.gitignore
+.gitattributes
+# IntelliJ / VSCode 工程配置
+.idea/
+*.iml
+.vscode/
+# 编辑器临时文件
+*.swp
+*.swo
+
+# ---------- 本地运行期产物 ----------
+# 本地环境变量文件（可能含后端地址等配置），不进镜像
+.env
+.env.local
+# 日志
+*.log
+
+# ---------- 容器与脚本 ----------
+# 避免把 Dockerfile 自身与 compose 文件重复打进去
+Dockerfile
+.dockerignore
+docker-compose.yml
+docker-compose.yaml
+
+# ---------- 操作系统生成的垃圾文件 ----------
+.DS_Store
+Thumbs.db

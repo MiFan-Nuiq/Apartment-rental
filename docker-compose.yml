@@ -1,0 +1,167 @@
+# ============================================================================
+# docker-compose.yml —— 公寓租赁管理系统「一键启动」本地测试环境
+#
+# 用途：
+#   一条命令拉起 MySQL + 后端 + 前端三个容器，把本地测试环境复现出来，
+#   供 test/automation/ 下的 pytest（接口 / UI / 数据库）直接运行。
+#
+# 常用命令（均在项目根目录执行）：
+#   docker compose up -d          # 构建镜像并后台启动全部服务
+#   docker compose ps             # 查看三个服务的状态（期望都是 healthy）
+#   docker compose logs -f backend    # 实时查看后端日志（可换成 mysql / frontend）
+#   docker compose down           # 停止并删除容器（保留数据卷，数据不丢）
+#   docker compose down -v        # 停止并删除容器 + 数据卷（清空数据库，谨慎使用）
+#   docker compose up -d --build  # 代码改动后重新构建并启动
+#
+# 启动顺序（由健康检查串起来，不靠固定 sleep 硬等）：
+#   mysql(healthy)  ->  backend(healthy)  ->  frontend
+#
+# 环境变量：
+#   全部可通过项目根目录的 .env 文件覆盖（模板见 .env.example），
+#   本文件中的 ${变量:-默认值} 写法表示「取 .env 的值，没有则用默认值」。
+#
+# 注意：文件不需要写 version: 字段——Compose V2 已废弃该字段，写了会打印告警。
+# ============================================================================
+
+services:
+  # -------------------------------------------------------------------------
+  # 服务一：MySQL 8.0 —— 数据库
+  #   依赖：无（最底层）
+  #   端口：3306（宿主机可直接用 mysql 客户端或 pytest 连入）
+  #   环境变量：库名 / 账号 / 密码，默认值与 backend/src/main/resources/application.yml 完全一致
+  # -------------------------------------------------------------------------
+  mysql:
+    image: mysql:8.0
+    container_name: apartment-mysql
+    restart: unless-stopped
+    environment:
+      # root 密码：仅容器内部与初始化脚本使用
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-root}
+      # 首次启动自动创建业务库（库名与 application.yml、CI 保持一致）
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-apartment_rental_db}
+      # 业务账号：对齐 application.yml 的 username=apartment / password=123456
+      MYSQL_USER: ${MYSQL_USER:-apartment}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-123456}
+      # 时区与 JDBC URL 中的 serverTimezone=Asia/Shanghai 保持一致，避免时间字段出现偏移
+      TZ: Asia/Shanghai
+    ports:
+      # 宿主机端口可用 .env 的 MYSQL_PORT 覆盖，默认 3306（与 CI、本地开发一致）
+      - "${MYSQL_PORT:-3306}:3306"
+    volumes:
+      # 数据持久化：容器删除后数据仍在，只有 docker compose down -v 才会清空
+      - mysql-data:/var/lib/mysql
+      # 首次启动自动建表 + 导入种子数据。
+      # 关键点：官方镜像会按「文件名字典序」执行 /docker-entrypoint-initdb.d/ 下的脚本，
+      #       而 data.sql 在字典序上排在 schema.sql 之前，直接挂原名会导致「先插数据后建表」而失败，
+      #       因此这里用 01- / 02- 前缀强制顺序（源文件本身不做任何改名或修改）。
+      - ./test/sql/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+      - ./test/sql/data.sql:/docker-entrypoint-initdb.d/02-data.sql:ro
+    healthcheck:
+      # 用 mysqladmin ping 探测「数据库真的可以接受连接」：
+      #   -h 127.0.0.1 强制走 TCP，避免误连初始化期间的临时实例（它只开 socket 且禁用网络）
+      #   $$ 是 compose 的转义写法，表示传给容器内 shell 的是 $MYSQL_ROOT_PASSWORD
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -u root -p$$MYSQL_ROOT_PASSWORD --silent"]
+      interval: 10s        # 每 10 秒探测一次
+      timeout: 5s          # 单次探测超时 5 秒
+      retries: 10          # 连续失败 10 次才判定 unhealthy
+      start_period: 40s    # 启动宽限期：留给初始化脚本导入 schema.sql + data.sql
+    networks:
+      - apartment-net
+
+  # -------------------------------------------------------------------------
+  # 服务二：后端 Spring Boot —— 被测服务
+  #   依赖：mysql 达到 healthy 后才启动（否则会因连不上库而启动失败）
+  #   端口：8080
+  #   环境变量：注入数据库连接信息，覆盖 application.yml 中的 localhost 默认值
+  # -------------------------------------------------------------------------
+  backend:
+    build:
+      context: ./backend         # 构建上下文
+      dockerfile: Dockerfile
+    container_name: apartment-backend
+    restart: unless-stopped
+    depends_on:
+      mysql:
+        # 用 service_healthy 而不是 service_started：
+        # 保证 MySQL 不仅容器起来了，而且初始化脚本已执行完、可以正常接受连接
+        condition: service_healthy
+    environment:
+      # 数据库连接：容器内必须用服务名 mysql，不能用 localhost（localhost 指向后端容器自身）
+      # URL 参数与 application.yml 保持一致（utf8 编码、时区、允许公钥检索）
+      SPRING_DATASOURCE_URL: "jdbc:mysql://mysql:3306/${MYSQL_DATABASE:-apartment_rental_db}?useSSL=false&serverTimezone=Asia/Shanghai&allowPublicKeyRetrieval=true&characterEncoding=utf8"
+      SPRING_DATASOURCE_USERNAME: ${MYSQL_USER:-apartment}
+      SPRING_DATASOURCE_PASSWORD: ${MYSQL_PASSWORD:-123456}
+      TZ: Asia/Shanghai
+    ports:
+      # 宿主机端口可用 .env 的 BACKEND_PORT 覆盖，默认 8080（与 CI、测试工程默认值一致）
+      - "${BACKEND_PORT:-8080}:8080"
+    healthcheck:
+      # 后端未引入 spring-boot-starter-actuator，没有 /actuator/health，
+      # 因此探测 /api/auth/login：它是 POST 接口，GET 访问会返回 405，
+      # 但只要拿到 2xx/401/403/405 任一响应就说明 Tomcat 已经起来了（与 CI 的探测思路一致）。
+      # 注意 ①：必须写 127.0.0.1 而不是 localhost——容器内 localhost 会解析成 IPv6 的 ::1，
+      #         而 Tomcat/Vite 监听的是 IPv4 的 0.0.0.0，用 localhost 会 "Connection refused"。
+      # 注意 ②：结尾不加 $ 锚定，避免 compose 把 $ 当成变量插值符号。
+      test: ["CMD-SHELL", "curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8080/api/auth/login | grep -qE '^(200|401|403|405)'"]
+      interval: 10s
+      timeout: 5s
+      retries: 12          # 后端启动 + JPA 建表较慢，允许更多次重试
+      start_period: 60s    # 启动宽限期
+    networks:
+      - apartment-net
+
+  # -------------------------------------------------------------------------
+  # 服务三：前端 Vite dev server —— UI 用例（Playwright）的被测对象
+  #   依赖：backend 达到 healthy 后才启动
+  #   端口：5173
+  #   环境变量：VITE_API_TARGET 指定 /api 请求的代理目标
+  # -------------------------------------------------------------------------
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        # 容器内安装 npm 依赖所用的源，默认国内镜像（可用 .env 的 NPM_REGISTRY 覆盖）
+        NPM_REGISTRY: ${NPM_REGISTRY:-https://registry.npmmirror.com}
+    container_name: apartment-frontend
+    restart: unless-stopped
+    depends_on:
+      backend:
+        # 等后端健康后再起前端，保证前端启动后 /api 代理立刻可用
+        condition: service_healthy
+    environment:
+      # Vite dev server 的 /api 代理目标（在 frontend/vite.config.js 中读取）。
+      # 必须写服务名 backend：代理请求是在前端容器内发起的，写 localhost 只会指向它自己。
+      VITE_API_TARGET: http://backend:8080
+      TZ: Asia/Shanghai
+    ports:
+      # 宿主机端口可用 .env 的 FRONTEND_PORT 覆盖，默认 5173（UI 用例默认访问该端口）
+      - "${FRONTEND_PORT:-5173}:5173"
+    healthcheck:
+      # 用 alpine 自带的 busybox wget 探测页面是否可访问。
+      # 同样必须写 127.0.0.1：容器内 localhost 解析为 IPv6 的 ::1，
+      # 而 Vite 监听的是 IPv4 的 0.0.0.0，用 localhost 会一直 "Connection refused"（实测踩过该坑）。
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:5173 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+    networks:
+      - apartment-net
+
+# ---------------------------------------------------------------------------
+# 自定义网络：三个服务都在同一网络下，容器之间可直接用服务名互相访问
+# （backend 通过 mysql:3306 连数据库，frontend 通过 backend:8080 代理接口）
+# ---------------------------------------------------------------------------
+networks:
+  apartment-net:
+    name: apartment-net
+    driver: bridge
+
+# ---------------------------------------------------------------------------
+# 数据卷：MySQL 数据持久化。
+# 命名卷由 Docker 管理，不会出现在项目目录里；如需清空执行 docker compose down -v
+# ---------------------------------------------------------------------------
+volumes:
+  mysql-data:
+    name: apartment-mysql-data
