@@ -5,18 +5,28 @@ conftest.py —— pytest 全局共享 fixture、配置与钩子
 集中管理：
     - 配置常量：后端/前端地址、登录账号、业务数据 ID、数据库连接信息（均可环境变量覆盖）
     - 接口 fixture：base_url / api_client / auth_token / auth_headers / appointment_data
+    - 动态数据 fixture：unique_suffix / temp_apartment / temp_appointment（用例级隔离 + 自动清理）
     - 数据库 fixture：db_connection（session 级，pymysql 直连 MySQL）
     - UI fixture：browser（module 级浏览器）/ ui_page（用例级页面，含 trace 录制）
     - 失败钩子：pytest_runtest_makereport —— UI 用例失败时自动截图并保存 Playwright trace
+
+测试数据管理策略（静态打底 + 动态隔离）：
+    - 静态种子数据（test/sql/data.sql）：登录账号、基础房源（id=1/2/3）、合同/流水等公共稳定数据；
+    - 动态 fixture（本文件）：用例运行期通过接口临时创建的房源与预约，用例结束立即清理。
+      这样用例之间互不依赖、互不污染，也不会给数据库留下脏数据。
 
 注意：登录账号、数据库密码等敏感/易变配置统一在此处集中管理，避免散落多个文件。
 """
 
 import os
+import uuid
+from datetime import datetime
 from pathlib import Path
 
 import pytest
 
+from apis.apartment_api import create_apartment, delete_apartment
+from apis.appointment_api import create_appointment, delete_appointment
 from apis.login_api import get_token
 from utils.db_util import DBUtil
 from utils.request_util import RequestUtil
@@ -132,6 +142,243 @@ def appointment_data() -> dict:
         "appointment_time": APPOINTMENT_TIME,
         "remark": REMARK,
     }
+
+
+# ==================== 动态测试数据 fixture（用例级隔离 + 用例后自动清理） ====================
+# 设计思路：
+#   静态种子数据（test/sql/data.sql）负责"公共、稳定"的数据（登录账号、基础房源、权限）；
+#   业务操作产生的"会变化"的数据（临时房源、临时预约）一律由下面的 fixture 动态创建，
+#   并在用例结束后立即清理，从而做到：用例之间数据隔离、互不污染、库里不留脏数据。
+
+
+def safe_delete(delete_func, client: RequestUtil, token: str, record_id: int, label: str):
+    """
+    安全删除辅助函数：删除失败只打印中文警告，不抛异常。
+
+    用途:
+        供 fixture 与用例的 finalizer 复用，保证动态数据被清理，
+        且清理失败不会掩盖原始断言错误（避免连锁失败）。
+
+    参数:
+        delete_func: 删除接口函数（delete_apartment / delete_appointment）
+        client: RequestUtil 请求工具实例
+        token: 登录 token
+        record_id: 待删除记录 id
+        label: 中文标签，用于日志（如"临时房源"/"临时预约"）
+    返回:
+        无
+    """
+    try:
+        resp = delete_func(client, token, record_id)
+        body = resp.json() if resp.status_code == 200 else {}
+        if resp.status_code != 200 or body.get("code") != 200:
+            # 常见原因：该房源下仍挂着预约（外键约束），提示人工确认是否有残留
+            print(f"[警告] 清理{label} id={record_id} 失败：HTTP {resp.status_code}，响应：{resp.text}")
+    except Exception as e:
+        # 绝不静默吞掉：打印警告提示人工确认数据库是否残留该条动态数据
+        print(f"[警告] 清理{label} id={record_id} 异常：{e}，请人工确认该数据是否残留")
+
+
+@pytest.fixture(scope="function")
+def dynamic_data_cleaner(request, api_client: RequestUtil, auth_headers: dict):
+    """
+    用例级 fixture：返回"登记动态数据清理"的函数，供用例清理自己创建的数据。
+
+    依赖:
+        request: pytest 内置 fixture（用于注册 finalizer）
+        api_client: 请求工具
+        auth_headers: 携带 Bearer token 的鉴权头
+    返回:
+        register(delete_func, record_id, label) -> None
+        调用后该记录会在用例结束（含失败）时被删除
+    说明:
+        为什么需要它：用例体内自己创建的预约并不属于任何 fixture，
+        若不登记清理，会在 temp_apartment 删除房源时触发外键约束（HTTP 500），
+        导致房源与预约双双残留。finalizer 的执行顺序为后进先出，
+        因此"用例创建的预约"会先于"fixture 的临时房源"被删除。
+    """
+    token = auth_headers["Authorization"].replace("Bearer ", "")
+
+    def register(delete_func, record_id: int, label: str):
+        """
+        登记一条动态数据的清理动作。
+
+        参数:
+            delete_func: 删除接口函数（delete_apartment / delete_appointment）
+            record_id: 待删除记录 id
+            label: 中文标签，用于日志
+        返回:
+            无
+        """
+        # 使用 finalizer 而非 finally：断言失败时同样会执行清理
+        request.addfinalizer(lambda: safe_delete(delete_func, api_client, token, record_id, label))
+
+    return register
+
+
+def build_temp_apartment_payload(name: str) -> dict:
+    """
+    构造临时房源的请求体（字段与后端 Apartment 实体保持一致）。
+
+    用途:
+        供 temp_apartment fixture 与"需要按需自建临时房源"的用例（如数据驱动用例）复用，
+        保证动态房源的字段口径统一。
+
+    参数:
+        name: 房源名称（需自带唯一后缀）
+    返回:
+        可直接传给 POST /api/apartments 的字典
+    """
+    return {
+        "name": name,
+        "address": f"自动化测试虚拟地址-{name}",
+        "building": "自动化A座",
+        "unit": "1单元",
+        "floor": "1",
+        "area": 60.00,
+        "monthlyRent": 1999.00,
+        # 项目真实房源状态枚举为"空置"（不存在"可预约"）
+        "status": "空置",
+        "auditStatus": "审核通过",
+        "description": f"pytest 动态数据，用例结束自动清理（标识：{name}）",
+        # landlord 以嵌套对象传入（JPA 多对一关联），房东 id 取自静态数据
+        "landlord": {"id": LANDLORD_ID},
+    }
+
+
+@pytest.fixture(scope="function")
+def unique_suffix() -> str:
+    """
+    用例级 fixture：生成不重复的测试数据标识后缀。
+
+    依赖:
+        无
+    返回:
+        形如 "20260919103000-3f9a1c2b" 的唯一字符串（时间戳 + 8 位短 uuid）
+    说明:
+        时间戳便于人工判断数据产生时间，短 uuid 保证同一秒内并发执行（pytest-xdist）也不重复；
+        用于拼接临时房源标题、备注等，避免与历史数据或其它用例的数据撞车。
+    """
+    # 时间戳（可读、可排序） + uuid4 前 8 位（并发下仍唯一）
+    return f"{datetime.now().strftime('%Y%m%d%H%M%S')}-{uuid.uuid4().hex[:8]}"
+
+
+@pytest.fixture(scope="function")
+def temp_apartment(api_client: RequestUtil, auth_headers: dict, unique_suffix: str) -> dict:
+    """
+    用例级 fixture：动态创建一条临时房源，用例结束后自动清理。
+
+    依赖:
+        api_client: 请求工具
+        auth_headers: 携带 Bearer token 的鉴权头
+        unique_suffix: 唯一后缀（保证房源标题不重复）
+    返回:
+        dict，包含:
+            - id: 新建房源的主键 id（用例据此提交预约、校验落库）
+            - name: 新建房源名称（含唯一后缀，便于识别残留数据）
+            - landlord_id: 关联的房东用户 id（取自静态数据的 LANDLORD_ID）
+            - suffix: 本次数据的唯一后缀
+            - raw: 创建接口返回的原始房源数据
+    清理逻辑:
+        用例结束（含失败）后调用 DELETE /api/apartments/{id} 删除该房源；
+        清理失败不抛异常（避免连锁失败），但会打印中文警告，提示人工确认残留数据。
+    异常:
+        AssertionError: 创建接口 HTTP 状态码 / 业务码异常，或未返回房源 id
+    """
+    # 从统一鉴权头中取出裸 token（接口层签名要求传 token 字符串）
+    token = auth_headers["Authorization"].replace("Bearer ", "")
+
+    # 标题与描述均带唯一后缀：既避免重名，也便于事后用 SQL 检索是否残留
+    name = f"自动化临时房源-{unique_suffix}"
+    # 请求体字段与后端 Apartment 实体保持一致（统一由 build_temp_apartment_payload 构造）
+    payload = build_temp_apartment_payload(name)
+
+    # ---------- 用例前：创建临时房源 ----------
+    resp = create_apartment(api_client, token, payload)
+    assert resp.status_code == 200, f"创建临时房源失败：HTTP {resp.status_code}，响应：{resp.text}"
+    body = resp.json()
+    assert body.get("code") == 200, f"创建临时房源失败：{body}"
+    data = body.get("data") or {}
+    apartment_id = data.get("id")
+    assert apartment_id, f"创建临时房源成功但未返回 id，响应：{body}"
+
+    # 交给用例使用
+    yield {
+        "id": apartment_id,
+        "name": name,
+        "landlord_id": LANDLORD_ID,
+        "suffix": unique_suffix,
+        "raw": data,
+    }
+
+    # ---------- 用例后：清理临时房源 ----------
+    # 清理失败只打印中文警告，不抛异常（避免连锁失败）
+    safe_delete(delete_apartment, api_client, token, apartment_id, "临时房源")
+
+
+@pytest.fixture(scope="function")
+def temp_appointment(
+    api_client: RequestUtil,
+    auth_headers: dict,
+    appointment_data: dict,
+    temp_apartment: dict,
+) -> dict:
+    """
+    用例级 fixture：在临时房源上动态创建一条临时预约，用例结束后自动清理。
+
+    依赖:
+        api_client: 请求工具
+        auth_headers: 携带 Bearer token 的鉴权头
+        appointment_data: 会话级预约基础数据（租户/房东 id、预约时间）
+        temp_apartment: 用例级临时房源，预约必须挂在这条房源上（避免使用静态 id）
+    返回:
+        dict，包含:
+            - id: 新建预约的主键 id
+            - apartment_id: 关联的临时房源 id
+            - tenant_id / landlord_id / appointment_time: 本次预约的业务字段
+            - remark: 本次预约备注（含唯一后缀，便于识别残留数据）
+            - raw: 创建接口返回的原始预约数据
+    清理逻辑:
+        用例结束（含失败）后调用 DELETE /api/appointments/{id} 删除该预约；
+        由于 fixture 清理顺序为后进先出，预约先于临时房源被删除，不会触发外键约束；
+        清理失败同样只打印中文警告，不抛异常。
+    异常:
+        AssertionError: 创建预约接口 HTTP 状态码 / 业务码异常，或未返回预约 id
+    """
+    token = auth_headers["Authorization"].replace("Bearer ", "")
+    # 备注追加唯一后缀，便于定位本次用例产生的预约数据
+    remark = f"{appointment_data['remark']}（{temp_apartment['suffix']}）"
+
+    # ---------- 用例前：创建临时预约（挂在临时房源的 apartment_id 上） ----------
+    resp = create_appointment(
+        api_client,
+        token=token,
+        apartment_id=temp_apartment["id"],
+        tenant_id=appointment_data["tenant_id"],
+        landlord_id=appointment_data["landlord_id"],
+        appointment_time=appointment_data["appointment_time"],
+        remark=remark,
+    )
+    assert resp.status_code == 200, f"创建临时预约失败：HTTP {resp.status_code}，响应：{resp.text}"
+    body = resp.json()
+    assert body.get("code") == 200, f"创建临时预约失败：{body}"
+    data = body.get("data") or {}
+    appointment_id = data.get("id")
+    assert appointment_id, f"创建临时预约成功但未返回 id，响应：{body}"
+
+    yield {
+        "id": appointment_id,
+        "apartment_id": temp_apartment["id"],
+        "tenant_id": appointment_data["tenant_id"],
+        "landlord_id": appointment_data["landlord_id"],
+        "appointment_time": appointment_data["appointment_time"],
+        "remark": remark,
+        "raw": data,
+    }
+
+    # ---------- 用例后：清理临时预约 ----------
+    # 清理失败只打印中文警告，不抛异常（避免连锁失败）
+    safe_delete(delete_appointment, api_client, token, appointment_id, "临时预约")
 
 
 @pytest.fixture(scope="session")

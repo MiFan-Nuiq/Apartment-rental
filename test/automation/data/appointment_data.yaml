@@ -7,12 +7,16 @@
 #   expect_success 是否期望提交成功（True=应返回 code 200 且状态为“待处理”；False=应返回非 200）
 # 关联字段说明（对齐后端 Appointment 实体 / appointments 表）：
 #   apartment_id 房源ID、tenant_id 租户ID、landlord_id 房东ID、appointment_time 预约时间、remark 备注
+#
+# 注意（动态数据策略）：expect_success=true 的用例会真实落库，
+# 其 apartment_id 由用例动态创建的临时房源替代（见 test_login_ddt.py），
+# 下方 apartment_id 仅对 expect_success=false 的负向用例生效；用例结束会自动清理，库中不留脏数据。
 
 cases:
   - id: appointment_success
     title: 正常预约：字段完整且房源有效，提交成功
     payload:
-      apartment_id: 3
+      apartment_id: 3          # 占位值：正向用例实际使用动态创建的临时房源 id
       tenant_id: 3
       landlord_id: 2
       appointment_time: "2026-10-01 10:00:00"

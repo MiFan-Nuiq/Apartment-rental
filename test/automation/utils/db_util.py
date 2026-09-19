@@ -44,6 +44,11 @@ def default_db_config() -> dict:
         "password": os.getenv("DB_PASSWORD", "123456"),     # 数据库密码
         "database": os.getenv("DB_NAME", "apartment_rental_db"),  # 库名
         "charset": "utf8mb4",                               # 支持中文与 emoji
+        # 关键：开启自动提交，让每条 SELECT 都拿到"最新已提交数据"。
+        # 原因：session 级长连接若关闭自动提交，第一次查询就会开启事务并建立
+        # REPEATABLE READ 一致性读快照，此后后端（另一个连接）新提交的房源/预约
+        # 在本连接里始终读不到，导致动态数据的落库校验误判为"未落库"。
+        "autocommit": True,
     }
 
 
