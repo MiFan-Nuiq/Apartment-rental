@@ -1,5 +1,20 @@
 # GitHub Actions 工作流 —— 公寓租赁管理系统自动化测试
-# 说明：push / pull_request 时自动执行冒烟测试，并上传 Allure 结果与 UI 失败截图/trace
+#
+# 触发策略（不同触发方式跑不同范围的用例，由「确定本次测试范围」步骤统一下发）：
+#   push 到 main        -> smoke + api（冒烟 + 接口用例，含 UI 冒烟，需要前端）
+#   pull_request        -> api + 数据一致性（接口用例 + db 一致性校验，不含 UI）
+#   schedule（定时任务） -> 全量用例（含 UI 测试）
+#   workflow_dispatch   -> 手动触发，同样按"全量"处理
+#
+# 质量门禁（本次新增）：
+#   pytest 的退出码会被记录下来，再由「质量门禁」步骤统一判定；
+#   只要退出码非 0 就让整个 job 失败（非零退出码），从而阻止 PR 合并。
+#   退出码含义：0=全部通过，1=有用例失败，2=执行被中断，5=未收集到用例。
+#   注意：xfail 不影响退出码（按预期失败仍算通过）。
+#
+# 失败通知（本次新增）：
+#   测试失败时输出失败用例列表、pytest 日志尾部，以及本次运行页面（artifact 下载入口），
+#   同时写入 GitHub Step Summary，便于直接定位。
 #
 # 环境准备链路（关键，缺一不可）：
 #   MySQL 服务容器就绪 -> 导入 test/sql/schema.sql 建表 -> 导入 test/sql/data.sql 种子数据
@@ -9,16 +24,37 @@
 
 name: 自动化测试
 
-# 触发条件：推送代码、提交 PR，以及支持手动触发
+# 触发条件：push 到 main、提交 PR、每天定时全量回归，以及支持手动触发
 on:
   push:
+    # 仅 main 分支的推送触发（其它分支可用 workflow_dispatch 手动跑）
+    branches: [main]
   pull_request:
+  schedule:
+    # 定时触发：GitHub Actions 的 cron 使用 UTC 时间，
+    # UTC 18:00 == 北京时间（UTC+8）次日 02:00，即"每天凌晨 2 点"。
+    # 若想改成其它时间，按"北京时间 - 8 小时"换算成 UTC 再填这里。
+    - cron: '0 18 * * *'
   workflow_dispatch:      # 支持在 GitHub 页面手动点击运行
 
 jobs:
   test:
     # 使用最新的 Ubuntu 运行器（已预装 Maven、Java、MySQL 客户端）
     runs-on: ubuntu-latest
+
+    # 全 job 共用环境变量：pytest（接口/UI/数据库用例）统一从这里读取。
+    # 注意 DB_HOST 用 localhost 而不是 127.0.0.1：
+    #   与 test/automation/utils/db_util.py 的默认值保持一致；
+    #   localhost 能同时覆盖容器/Ipv6 与 IPv4 两种监听情况，兼容性更好。
+    env:
+      HEADLESS: "true"                          # Playwright 无头模式（CI 无显示器）
+      BASE_URL: http://localhost:8080           # 后端地址
+      UI_BASE_URL: http://localhost:5173        # 前端地址（UI 用例使用）
+      DB_HOST: localhost                        # 数据库地址（db 用例使用）
+      DB_PORT: "3306"
+      DB_NAME: apartment_rental_db
+      DB_USER: apartment
+      DB_PASSWORD: "123456"
 
     # MySQL 服务容器：为后端提供数据库，库名/账号与 application.yml 默认值保持一致
     services:
@@ -178,6 +214,8 @@ jobs:
       #        npm run dev          -> 走 node_modules/.bin/vite 的 shim，最容易被权限位问题卡住
       #        npx --no-install     -> 最终仍去执行 .bin 下的 shim，同样可能 Permission denied
       #        node node_modules/vite/bin/vite.js  -> 只依赖 node 本身，彻底绕开 shim 与 PATH（本项目选用）
+      #      说明：这里不加 if 条件、统一启动，因为 push 到 main 的 smoke 集合里包含 UI 冒烟用例；
+      #            只有 PR 触发时用不到前端（PR 用例集不含 UI），多花约半分钟换取流程简单可靠。
       - name: 启动前端服务并等待就绪
         run: |
           # --host 0.0.0.0 允许外部访问；--strictPort 保证端口必须是 5173，
@@ -201,22 +239,70 @@ jobs:
           curl -s -o /dev/null http://localhost:5173 || { echo "前端启动失败：5173 不可访问"; exit 1; }
         working-directory: frontend
 
-      # ⑪ 执行冒烟测试（接口 + UI + 数据库校验核心链路）
-      #    无头模式：HEADLESS=true；服务与数据库连接信息均通过环境变量传入
-      - name: 运行冒烟测试
-        run: pytest -m smoke
-        working-directory: test/automation
-        env:
-          HEADLESS: "true"                          # Playwright 无头模式（CI 无显示器）
-          BASE_URL: http://localhost:8080           # 后端地址
-          UI_BASE_URL: http://localhost:5173        # 前端地址（UI 用例使用）
-          DB_HOST: 127.0.0.1                        # 数据库地址（db 用例使用）
-          DB_PORT: "3306"
-          DB_NAME: apartment_rental_db
-          DB_USER: apartment
-          DB_PASSWORD: "123456"
+      # ⑪-1 确定本次测试范围（按触发方式选择用例集）
+      #      用 markers 输出控制 pytest 的 -m 参数；markers 为空表示"不加过滤"，即全量
+      - name: 确定本次测试范围
+        id: scope
+        run: |
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            markers=""                                     # 空 = 不加 -m 过滤，即全量（含 UI）
+            desc="定时任务：全量用例（含 UI 测试）"
+          elif [ "${{ github.event_name }}" = "pull_request" ]; then
+            markers="api or (db and regression)"           # 接口用例 + 数据一致性校验
+            desc="PR：接口用例 + 数据一致性校验"
+          else
+            markers="smoke or api"                         # 冒烟 + 接口用例（含 UI 冒烟）
+            desc="push 到 main：冒烟用例 + 接口用例"
+          fi
+          # 写入步骤输出，供后续步骤引用
+          echo "markers=$markers" >> "$GITHUB_OUTPUT"
+          echo "desc=$desc" >> "$GITHUB_OUTPUT"
+          echo "触发方式：${{ github.event_name }}"
+          echo "本次测试范围：$desc"
+          echo "对应的 pytest 过滤参数：-m \"$markers\"（为空表示不加过滤=全量）"
 
-      # ⑫ 上传 Allure 原始结果（供本地 allure serve 或后续生成报告）
+      # ⑪-2 执行测试（按上一步确定的范围）
+      #      本步骤**刻意不让 job 失败**：只把退出码记录下来，
+      #      由下一步「质量门禁」统一定性，这样即使用例失败，
+      #      后面的 artifact 上传与失败通知也一定会执行到，不会丢报告。
+      - name: 运行测试
+        id: pytest_run
+        working-directory: test/automation
+        run: |
+          markers='${{ steps.scope.outputs.markers }}'
+          # -rfE   ：失败/错误用例汇总成 FAILED/ERROR 列表（失败通知要用）
+          # --tb=short：失败堆栈用精简格式，日志更易读
+          # --color=no：关闭 ANSI 颜色，避免干扰 grep 提取失败列表
+          args=(-rfE --tb=short --color=no)
+          if [ -n "$markers" ]; then
+            args+=(-m "$markers")
+          fi
+          echo "执行命令：pytest ${args[*]}"
+          # 关闭 -e，让 pytest 非零退出码不会立刻中断脚本；同时用 tee 保留完整日志
+          set +e
+          pytest "${args[@]}" 2>&1 | tee pytest_output.log
+          rc=${PIPESTATUS[0]}
+          set -e
+          echo "exit_code=$rc" >> "$GITHUB_OUTPUT"
+          echo "pytest 退出码=$rc（0=通过，1=有用例失败，2=中断，5=未收集到用例）"
+
+      # ⑫ 质量门禁：检查 pytest 退出码，非 0 则让 job 失败（非零退出码退出，阻止 PR 合并）
+      - name: 质量门禁（检查 pytest 退出码）
+        if: always()
+        run: |
+          rc="${{ steps.pytest_run.outputs.exit_code }}"
+          # 退出码为空说明"运行测试"步骤根本没执行到（前置步骤已失败），同样视为门禁不通过
+          if [ -z "$rc" ]; then
+            echo "::error::质量门禁不通过：未取得 pytest 退出码，测试步骤未执行（前置步骤已失败）"
+            exit 1
+          fi
+          if [ "$rc" != "0" ]; then
+            echo "::error::质量门禁不通过：pytest 退出码=$rc，PR 不允许合并（详见下方失败通知）"
+            exit "$rc"
+          fi
+          echo "质量门禁通过：pytest 退出码=0（xfail 按预期失败，不计入失败）"
+
+      # ⑬ 上传 Allure 原始结果（供本地 allure serve 或后续生成报告）
       - name: 上传 Allure 结果
         if: always()
         uses: actions/upload-artifact@v4
@@ -225,7 +311,7 @@ jobs:
           path: test/automation/allure-results
           if-no-files-found: warn
 
-      # ⑬ 上传 UI 失败截图（不存在时忽略，避免误报失败）
+      # ⑭ 上传 UI 失败截图（不存在时忽略，避免误报失败）
       - name: 上传失败截图
         if: always()
         uses: actions/upload-artifact@v4
@@ -234,7 +320,7 @@ jobs:
           path: test/automation/screenshots
           if-no-files-found: ignore
 
-      # ⑭ 上传 Playwright trace（不存在时忽略）
+      # ⑮ 上传 Playwright trace（不存在时忽略）
       - name: 上传 Playwright trace
         if: always()
         uses: actions/upload-artifact@v4
@@ -242,3 +328,59 @@ jobs:
           name: traces
           path: test/automation/traces
           if-no-files-found: ignore
+
+      # ⑯ 失败通知：输出失败用例列表 + 报告/产物入口（用 always 保证即使门禁失败也能执行到）
+      - name: 测试结果摘要与失败通知
+        if: always()
+        env:
+          # 本次运行页面：artifacts 的下载入口就在这个页面的底部
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          RUN_EXIT_CODE: ${{ steps.pytest_run.outputs.exit_code }}
+        run: |
+          echo "===================== 测试结果摘要 ====================="
+          echo "触发方式：${{ github.event_name }}"
+          echo "测试范围：${{ steps.scope.outputs.desc }}"
+          echo "pytest 退出码：${RUN_EXIT_CODE:-（未取得，测试步骤未执行）}"
+          echo "运行页面（artifact 下载入口）：$RUN_URL"
+          echo "可下载的产物：allure-results（Allure 原始结果）、screenshots（UI 失败截图）、traces（Playwright trace）"
+          echo "本地查看 Allure 报告：下载 allure-results 后执行  allure serve allure-results"
+          echo "======================================================="
+
+          # 仅当退出码非 0（测试失败）时，额外输出失败用例清单与日志尾部
+          if [ -n "$RUN_EXIT_CODE" ] && [ "$RUN_EXIT_CODE" != "0" ]; then
+            echo ""
+            echo "!!!!!!!!!!!!!!!!!!!! 失败用例列表 !!!!!!!!!!!!!!!!!!!!"
+            if [ -f test/automation/pytest_output.log ]; then
+              # pytest 的 -rfE 会把失败/错误汇总为 "FAILED xxx"/"ERROR xxx" 行
+              if ! grep -E "^(FAILED|ERROR)" test/automation/pytest_output.log; then
+                echo "（未从日志中匹配到 FAILED/ERROR 行，可能是收集阶段或前置步骤失败）"
+              fi
+              echo "----------------- pytest 日志尾部（最后 40 行）-----------------"
+              tail -n 40 test/automation/pytest_output.log
+            else
+              echo "未找到 test/automation/pytest_output.log（测试步骤可能未执行）"
+            fi
+            echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+          fi
+
+          # 写入 GitHub Step Summary，便于在运行页面上直接看到结论
+          {
+            echo "## 自动化测试结果（${{ github.event_name }}）"
+            echo ""
+            echo "| 项 | 内容 |"
+            echo "| --- | --- |"
+            echo "| 测试范围 | ${{ steps.scope.outputs.desc }} |"
+            echo "| pytest 退出码 | ${RUN_EXIT_CODE:-未取得} |"
+            echo "| 运行页面 | [点此查看运行详情与 artifacts]($RUN_URL) |"
+            echo ""
+            if [ -n "$RUN_EXIT_CODE" ] && [ "$RUN_EXIT_CODE" != "0" ]; then
+              echo "### 结论：失败（质量门禁未通过，阻止合并）"
+              echo ""
+              echo "失败用例："
+              echo '```'
+              grep -E "^(FAILED|ERROR)" test/automation/pytest_output.log || echo "见运行日志"
+              echo '```'
+            else
+              echo "### 结论：通过（质量门禁通过）"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
