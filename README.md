@@ -1,7 +1,15 @@
 [![自动化测试](https://github.com/MiFan-Nuiq/Apartment-rental/actions/workflows/auto-test.yml/badge.svg?branch=main)](https://github.com/MiFan-Nuiq/Apartment-rental/actions/workflows/auto-test.yml)
+![代码覆盖率](https://img.shields.io/badge/coverage-99%25-brightgreen)
 # 公寓租赁管理系统 · 测试项目
 
 本项目为「公寓租赁管理系统」的测试专项工程，覆盖**手工测试用例、接口自动化、数据库一致性校验、UI 自动化、缺陷管理**五个维度，用于毕业设计的测试作品集展示与日后回归验证。
+
+> **关于覆盖率 badge**：上面这枚是 shields.io 的**静态** badge，数值取自本地全量回归的实测结果
+> （`apis/` + `utils/` + `pages/` 共 277 条语句，覆盖 273 条，**99%**）。
+> 因为项目暂未接入 codecov（需要额外的账号与 token），所以它不会自动更新——
+> 覆盖率发生变化时需手动改 badge 里的数字。
+> 统计口径与门槛见 [test/automation/pytest.ini](test/automation/pytest.ini)：
+> 低于 **90%** 时 pytest 会直接失败，CI 质量门禁随之不通过。
 
 ## 目录结构
 

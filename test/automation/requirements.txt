@@ -5,6 +5,7 @@ requests>=2.31.0        # HTTP 请求库：接口层与请求工具（utils/requ
 pytest>=8.0.0           # 测试框架：用例收集、执行、fixture 与 marker 管理
 allure-pytest>=2.13.2   # Allure 报告插件：生成 allure-results 报告数据
 pytest-xdist>=3.5.0     # 并行执行插件：pytest -n auto 多进程加速用例（可选）
+pytest-cov>=5.0.0       # 覆盖率插件：统计 apis/ 与 utils/ 的代码覆盖率，产出终端/XML/HTML 报告
 pymysql>=1.1.0          # MySQL 驱动：utils/db_util.py 直连数据库做一致性校验
 pyyaml>=6.0.1           # YAML 解析：读取 data/*.yaml 数据驱动用例集
 playwright>=1.40.0      # 浏览器自动化库：UI 用例（pages/ + testcases/test_ui_login.py）依赖

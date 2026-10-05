@@ -16,6 +16,12 @@
 #   测试失败时输出失败用例列表、pytest 日志尾部，以及本次运行页面（artifact 下载入口），
 #   同时写入 GitHub Step Summary，便于直接定位。
 #
+# 覆盖率报告（本次新增）：
+#   由 test/automation/pytest.ini 的 addopts 统一开启，统计 apis/ 与 utils/ 两个包；
+#   终端报告随 pytest 日志直接输出，XML + HTML 产出到 test/automation/coverage/，
+#   并上传为 artifact「coverage-report」。
+#   当前基线覆盖率 95%，门槛值待定，因此**尚未配置 --cov-fail-under**。
+#
 # 环境准备链路（关键，缺一不可）：
 #   MySQL 服务容器就绪 -> 导入 test/sql/schema.sql 建表 -> 导入 test/sql/data.sql 种子数据
 #   -> 构建并启动后端 -> 等待 8080 可访问 -> 后台启动前端 Vite -> 等待 5173 可访问 -> 跑 pytest
@@ -273,6 +279,9 @@ jobs:
           # -rfE   ：失败/错误用例汇总成 FAILED/ERROR 列表（失败通知要用）
           # --tb=short：失败堆栈用精简格式，日志更易读
           # --color=no：关闭 ANSI 颜色，避免干扰 grep 提取失败列表
+          # 覆盖率：由 test/automation/pytest.ini 的 addopts（--cov=apis --cov=utils 及三个
+          #         --cov-report）统一开启并输出到 coverage/，这里刻意不再重复传 --cov，
+          #         避免同一份配置写两处、后续改动时不一致。
           args=(-rfE --tb=short --color=no)
           if [ -n "$markers" ]; then
             args+=(-m "$markers")
@@ -329,7 +338,20 @@ jobs:
           path: test/automation/traces
           if-no-files-found: ignore
 
-      # ⑯ 失败通知：输出失败用例列表 + 报告/产物入口（用 always 保证即使门禁失败也能执行到）
+      # ⑯ 上传覆盖率报告（终端报告已随 pytest 日志输出；这里上传 XML + HTML 原始产物）
+      #    说明：coverage/ 目录由 pytest.ini 的 --cov-report 配置生成；
+      #          目录内的 .gitignore 由 coverage 自己写入，不会污染仓库。
+      #    注意：覆盖率门槛（--cov-fail-under）本次**刻意未配置**，
+      #          现有基线为 95%，等确定门槛值后再加到 pytest.ini 的 addopts 里。
+      - name: 上传覆盖率报告
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: test/automation/coverage
+          if-no-files-found: warn
+
+      # ⑰ 失败通知：输出失败用例列表 + 报告/产物入口（用 always 保证即使门禁失败也能执行到）
       - name: 测试结果摘要与失败通知
         if: always()
         env:
@@ -342,7 +364,7 @@ jobs:
           echo "测试范围：${{ steps.scope.outputs.desc }}"
           echo "pytest 退出码：${RUN_EXIT_CODE:-（未取得，测试步骤未执行）}"
           echo "运行页面（artifact 下载入口）：$RUN_URL"
-          echo "可下载的产物：allure-results（Allure 原始结果）、screenshots（UI 失败截图）、traces（Playwright trace）"
+          echo "可下载的产物：allure-results（Allure 原始结果）、screenshots（UI 失败截图）、traces（Playwright trace）、coverage-report（覆盖率 XML + HTML）"
           echo "本地查看 Allure 报告：下载 allure-results 后执行  allure serve allure-results"
           echo "======================================================="
 

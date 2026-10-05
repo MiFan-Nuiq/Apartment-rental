@@ -2,7 +2,7 @@
 """
 核心业务流程测试用例：登录 -> 房源查询 -> 预约提交
 
-覆盖点（对应原 test/automation/test_core_flow.py 的 7 个用例 + 1 个动态数据演示用例）：
+覆盖点（对应原 test/automation/test_core_flow.py 的 7 个用例 + 2 个新增用例）：
     1. 正确账号密码登录成功，返回 token 及用户信息
     2. 密码错误时返回业务提示
     3. 用户不存在时返回业务提示
@@ -11,6 +11,7 @@
     6. 携带 token 提交预约成功，状态为"待处理"（房源改用动态 temp_apartment）
     7. 端到端主流程连贯执行（查询用静态数据，预约用动态数据）
     8. 【新增】动态数据管理演示：临时房源 + 唯一后缀，用例后自动清理
+    9. 【新增】按 id 查询预约详情：校验 GET /api/appointments/{id} 返回与创建时一致
 
 分层结构：
     testcases（本文） -> apis（接口层） -> utils（请求/断言工具）
@@ -26,7 +27,7 @@ import allure
 import pytest
 
 from apis.apartment_api import get_apartments, get_apartments_without_token
-from apis.appointment_api import create_appointment, delete_appointment
+from apis.appointment_api import create_appointment, delete_appointment, get_appointment_by_id
 from apis.login_api import login
 from utils.assert_util import (
     assert_business_code,
@@ -338,3 +339,46 @@ class TestCoreFlow:
             )
             assert row["tenant_id"] == appointment_data["tenant_id"], "数据库 tenant_id 与提交不一致"
             assert row["status"] == "待处理", f"数据库预约状态应为'待处理'，实际：{row['status']}"
+
+    @allure.title("预约：按 id 查询预约详情成功且字段与创建时一致")
+    @pytest.mark.api
+    @pytest.mark.regression
+    def test_get_appointment_detail_by_id(self, api_client, auth_headers, appointment_data, temp_appointment):
+        """
+        验证按 id 查询预约详情接口（GET /api/appointments/{id}）返回与创建时一致的预约数据。
+
+        依赖:
+            api_client / auth_headers: 请求工具与鉴权头
+            appointment_data: 预约基础数据（租户/房东 id，用于比对详情字段）
+            temp_appointment: 用例级临时预约（挂在临时房源上，用例后自动清理）
+        返回:
+            无；任一断言失败抛 AssertionError
+        清理逻辑:
+            本用例只读不写、不新建任何数据；
+            临时预约与临时房源由 fixture 在用例结束后按后进先出自动删除
+        """
+        appointment_id = temp_appointment["id"]
+        token = auth_headers["Authorization"].replace("Bearer ", "")
+
+        # 步骤一：按 id 查询预约详情
+        with allure.step(f"按 id 查询预约详情：GET /api/appointments/{appointment_id}"):
+            resp = get_appointment_by_id(api_client, token, appointment_id)
+            assert_status_code(resp, 200)
+            assert_business_code(resp, 200)
+
+        # 步骤二：校验详情字段与创建时一致
+        with allure.step("校验预约详情字段与创建时一致"):
+            data = resp.json().get("data")
+            assert data is not None, "查询预约详情返回 data 为空"
+            assert_field_exists(
+                data, ["id", "apartment", "tenant", "landlord", "appointmentTime", "status", "remark"]
+            )
+            assert_field_equal(data, "id", appointment_id)
+            # 关联对象以嵌套结构返回，逐个比对外键 id
+            assert_field_equal(data["apartment"], "id", temp_appointment["apartment_id"])
+            assert_field_equal(data["tenant"], "id", appointment_data["tenant_id"])
+            assert_field_equal(data["landlord"], "id", appointment_data["landlord_id"])
+            # 新建预约的默认状态为"待处理"（后端 AppointmentService.save 的默认值）
+            assert_field_equal(data, "status", "待处理")
+            # 备注由 temp_appointment fixture 生成（含本次用例的唯一后缀），应原样返回
+            assert_field_equal(data, "remark", temp_appointment["remark"])
